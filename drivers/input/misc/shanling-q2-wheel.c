@@ -5,6 +5,7 @@
 #include <linux/i2c.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of.h>
 
@@ -12,6 +13,8 @@ struct q2_wheel {
 	struct i2c_client *client;
 	struct input_dev *input;
 	struct gpio_desc *reset;
+	ktime_t ready_at;
+	bool irq_masked;
 };
 
 /* Stock hyn_wr_reg uses separate STOP-terminated transfers, not SMBus's
@@ -176,27 +179,81 @@ static void q2_wheel_shutdown(struct i2c_client *client)
 static int q2_wheel_suspend(struct device *dev)
 {
 	struct q2_wheel *wheel = dev_get_drvdata(dev);
+	bool was_masked = wheel->irq_masked;
+	int ret;
 
-	disable_irq(wheel->client->irq);
+	wheel->ready_at = 0;
+	if (!was_masked) {
+		disable_irq(wheel->client->irq);
+		wheel->irq_masked = true;
+	}
 	q2_wheel_release(wheel);
-	gpiod_set_value_cansleep(wheel->reset, 1);
+
+	ret = gpiod_set_value_cansleep(wheel->reset, 1);
+	if (ret) {
+		if (!was_masked) {
+			wheel->irq_masked = false;
+			enable_irq(wheel->client->irq);
+		}
+		return ret;
+	}
+
+	/* Complete the stock reset pulse minimum before the platform enters sleep. */
+	usleep_range(11000, 12000);
+	return 0;
+}
+
+static int q2_wheel_resume_early(struct device *dev)
+{
+	struct q2_wheel *wheel = dev_get_drvdata(dev);
+	int ret;
+
+	if (!wheel->irq_masked || wheel->ready_at)
+		return 0;
+
+	/* PB20 is on the SoC GPIO controller. Leave the I2C transfer to resume. */
+	ret = gpiod_set_value_cansleep(wheel->reset, 0);
+	if (ret)
+		return ret;
+
+	wheel->ready_at = ktime_add_ms(ktime_get(), 50);
 	return 0;
 }
 
 static int q2_wheel_resume(struct device *dev)
 {
 	struct q2_wheel *wheel = dev_get_drvdata(dev);
+	s64 remaining;
 	int ret;
 
-	usleep_range(11000, 12000);
-	gpiod_set_value_cansleep(wheel->reset, 0);
-	msleep(50);
+	if (!wheel->irq_masked)
+		return 0;
+
+	/* Abort paths can resume without ever reaching the early callback. */
+	ret = q2_wheel_resume_early(dev);
+	if (ret)
+		return ret;
+
+	remaining = ktime_sub(wheel->ready_at, ktime_get());
+	if (remaining > 0) {
+		unsigned long usecs = DIV_ROUND_UP_ULL(remaining, NSEC_PER_USEC);
+
+		usleep_range(usecs, usecs + 1000);
+	}
+
 	ret = q2_wheel_normal_mode(wheel);
+	if (ret)
+		return ret;
+
+	wheel->irq_masked = false;
 	enable_irq(wheel->client->irq);
-	return ret;
+	return 0;
 }
-static DEFINE_SIMPLE_DEV_PM_OPS(q2_wheel_pm_ops,
-			      q2_wheel_suspend, q2_wheel_resume);
+
+static const struct dev_pm_ops q2_wheel_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(q2_wheel_suspend, q2_wheel_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(NULL, q2_wheel_resume_early)
+};
 
 static const struct of_device_id q2_wheel_of_match[] = {
 	{ .compatible = "shanling,q2-wheel" },
