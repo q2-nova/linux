@@ -71,7 +71,6 @@ struct cw_battery {
 	int voltage_mv;
 	int status;
 	int time_to_empty;
-	int charge_count;
 
 	u32 poll_interval_ms;
 	u8 alert_level;
@@ -352,11 +351,8 @@ static void cw_update_charge_status(struct cw_battery *cw_bat)
 		bool charger_attached;
 
 		charger_attached = !!ret;
-		if (cw_bat->charger_attached != charger_attached) {
+		if (cw_bat->charger_attached != charger_attached)
 			cw_bat->battery_changed = true;
-			if (charger_attached)
-				cw_bat->charge_count++;
-		}
 		cw_bat->charger_attached = charger_attached;
 	}
 }
@@ -499,10 +495,6 @@ static int cw_battery_get_property(struct power_supply *psy,
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
 		break;
 
-	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
-		val->intval = cw_bat->charge_count;
-		break;
-
 	case POWER_SUPPLY_PROP_CHARGE_FULL:
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
 		val->intval = max(cw_bat->battery->charge_full_design_uah, 0);
@@ -541,7 +533,6 @@ static enum power_supply_property cw_battery_properties[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
-	POWER_SUPPLY_PROP_CHARGE_COUNTER,
 	POWER_SUPPLY_PROP_CHARGE_FULL,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
 	POWER_SUPPLY_PROP_CHARGE_NOW,
