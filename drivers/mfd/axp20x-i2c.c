@@ -27,6 +27,10 @@
 
 #include "axp2101-rail-snapshot.h"
 
+static bool q2_bulk_rail_audit;
+module_param(q2_bulk_rail_audit, bool, 0644);
+MODULE_PARM_DESC(q2_bulk_rail_audit, "Read the Q2 AXP2101 rail audit in native I2C bursts");
+
 /* Inserted into the owning I2C driver; private allocation, no public ABI change. */
 enum axp2101_rail_phase { RAIL_LIVE, RAIL_SUSPEND, RAIL_RESUME, RAIL_PHASES };
 
@@ -45,6 +49,25 @@ static int axp2101_rail_read(void *context, unsigned int reg, unsigned int *valu
 	return regmap_read_bypassed(axp20x->regmap, reg, value);
 }
 
+static int axp2101_rail_read_block(void *context, u8 reg, u8 *values, size_t count)
+{
+	struct axp20x_dev *axp20x = context;
+	struct i2c_client *client = to_i2c_client(axp20x->dev);
+	struct i2c_msg messages[] = {
+		{ .addr = client->addr, .len = 1, .buf = &reg },
+		{ .addr = client->addr, .flags = I2C_M_RD, .len = count, .buf = values },
+	};
+	int ret;
+
+	/* Same addressed repeated-start frame as regmap-i2c. Never alter
+	 * shared cache flags or publish these readbacks into the cache.
+	 */
+	ret = i2c_transfer(client->adapter, messages, ARRAY_SIZE(messages));
+	if (ret < 0)
+		return ret;
+	return ret == ARRAY_SIZE(messages) ? 0 : -EIO;
+}
+
 static u64 axp2101_rail_clock(void *context)
 {
 	return ktime_get_boottime_ns();
@@ -52,13 +75,17 @@ static u64 axp2101_rail_clock(void *context)
 
 static void axp20x_rail_record(struct axp20x_i2c_state *state, unsigned int phase)
 {
-	const struct axp2101_rail_io io = {
+	struct i2c_client *client = to_i2c_client(state->axp20x.dev);
+	struct axp2101_rail_io io = {
 		.read = axp2101_rail_read, .clock = axp2101_rail_clock,
 		.context = &state->axp20x,
 	};
 
 	if (state->axp20x.variant != AXP2101_ID)
 		return;
+	if (READ_ONCE(q2_bulk_rail_audit) && of_machine_is_compatible("shanling,q2") &&
+	    i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
+		io.read_block = axp2101_rail_read_block;
 	mutex_lock(&state->rail_lock);
 	axp2101_rail_capture(&state->rail[phase], &io);
 	state->rail_count[phase]++;
