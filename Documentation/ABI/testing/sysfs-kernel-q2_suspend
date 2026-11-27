@@ -1,0 +1,18 @@
+What:		/sys/kernel/q2_suspend/s2idle
+KernelVersion:	7.3
+Description:
+		Allows suspend-to-idle on the Ingenic X2000 when the kernel
+		is built with CONFIG_INGENIC_X2000_NORMAL_SLEEP. Reading
+		returns 0 or 1. Writing a boolean accepted by kstrtobool()
+		sets it; the write takes the system sleep lock, so it does not
+		change the setting during a transition. The default is 0.
+
+		While it is 0, writing "freeze" to /sys/power/state, or
+		"s2idle" to /sys/power/mem_sleep followed by "mem" to
+		/sys/power/state, fails with -EINVAL before devices are
+		suspended. While it is 1, suspend-to-idle runs through the
+		generic PM core, which owns device suspend and wake
+		interrupts; the platform's retained-memory deep sleep is
+		not used for it.
+
+		The file is mode 0600.

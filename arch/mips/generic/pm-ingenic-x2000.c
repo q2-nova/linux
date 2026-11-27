@@ -1452,6 +1452,50 @@ static int x2000_pm_enter(suspend_state_t state)
 	return ret ?: clock_ret;
 }
 
+/* Generic suspend-to-idle owns device PM and pending wake IRQs. Keep its
+ * admission separate from the retained-DDR deep sleep admission.
+ */
+static bool allow_s2idle;
+
+static ssize_t s2idle_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(allow_s2idle));
+}
+
+static ssize_t s2idle_store(struct kobject *kobj, struct kobj_attribute *attr,
+			    const char *buf, size_t count)
+{
+	unsigned int flags;
+	bool allow;
+	int ret;
+
+	ret = kstrtobool(buf, &allow);
+	if (ret)
+		return ret;
+
+	flags = lock_system_sleep();
+	WRITE_ONCE(allow_s2idle, allow);
+	unlock_system_sleep(flags);
+	return count;
+}
+static struct kobj_attribute s2idle_attr = __ATTR(s2idle, 0600, s2idle_show, s2idle_store);
+
+static int x2000_s2idle_begin(void)
+{
+	return READ_ONCE(allow_s2idle) ? 0 : -EINVAL;
+}
+
+static void x2000_s2idle_end(void)
+{
+	/* The generic PM core falls back to the deep end hook if absent. */
+}
+
+static const struct platform_s2idle_ops x2000_s2idle_ops = {
+	.begin = x2000_s2idle_begin,
+	.end = x2000_s2idle_end,
+};
+
 static const struct platform_suspend_ops x2000_pm_ops = {
 	.begin = x2000_pm_begin,
 	.end = x2000_pm_end,
@@ -1498,7 +1542,7 @@ static int __init x2000_pm_init(void)
   };
   static const struct attribute_group group = { .attrs = attributes };
   static struct attribute *normal_attributes[] = {
-   &entry_policy_attr.attr, &normal_exclk_attr.attr, &proof_attr.attr, NULL
+   &entry_policy_attr.attr, &normal_exclk_attr.attr, &proof_attr.attr, &s2idle_attr.attr, NULL
   };
   static const struct attribute_group normal_group = { .attrs = normal_attributes };
   ret = sysfs_create_group(proof_kobj,
@@ -1511,6 +1555,8 @@ static int __init x2000_pm_init(void)
 	/* Do not read/clear a predecessor journal merely because we booted. */
 	writel(0, sram + SRAM_CONTEXT + JOURNAL_ACTIVE);
 	suspend_set_ops(&x2000_pm_ops);
+	if (IS_ENABLED(CONFIG_INGENIC_X2000_NORMAL_SLEEP))
+		s2idle_set_ops(&x2000_s2idle_ops);
 	pr_info("X2000: retained SRAM deep-sleep backend registered (%lu bytes)\n", size);
 	return 0;
 unmap:
