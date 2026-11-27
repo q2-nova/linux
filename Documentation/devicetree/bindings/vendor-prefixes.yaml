@@ -1505,6 +1505,8 @@ patternProperties:
     description: SG Micro Corp
   "^sgx,.*":
     description: SGX Sensortech
+  "^shanling,.*":
+    description: Shanling
   "^sharp,.*":
     description: Sharp Corporation
   "^shift,.*":

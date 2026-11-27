@@ -427,7 +427,14 @@
 
 		.macro	RESTORE_SP_AND_RET docfi=0
 		RESTORE_SP \docfi
-#if defined(CONFIG_CPU_MIPSR5) || defined(CONFIG_CPU_MIPSR6)
+/*
+ * ERETNC is a Release 5 instruction. Ingenic XBurst2 cores report Release 2
+ * in Config0 although the kernel is built for MIPS32r5 (MSA, FP64), and
+ * raise a Reserved Instruction exception for it; plain ERET also clears
+ * LLbit, which is all ERETNC avoids.
+ */
+#if defined(CONFIG_CPU_MIPSR6) || \
+	(defined(CONFIG_CPU_MIPSR5) && !defined(CONFIG_MACH_INGENIC_SOC))
 		eretnc
 #else
 		.set	push

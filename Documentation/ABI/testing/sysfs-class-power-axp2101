@@ -1,0 +1,72 @@
+What: /sys/class/power_supply/axp20x-battery/charge_monitor
+Date: November 2026
+Description:
+        Read-only AXP2101 Q2 charger observations, a versioned space-separated
+        key=value line. Returns the register I/O errno on incomplete reads.
+        version=1 reports thermal_regulation (live PMU_STATUS1 bit1),
+        ts_monitoring (TS pin affects the charger), ts_adc_enabled,
+        die_adc_enabled, battery_detection, ts_raw (-1 if ADC disabled),
+        ts_valid (not disabled, saturated or overflowed), irq48_raw,
+        irq4a_raw, and fault_history. The two IRQ bytes are historical W1C
+        flags, never live fault assertions; reads do not clear them.
+        fault_history ORs observed REG48[3:0] into bits3:0, REG4A[2:0] into
+        bits10:8 since this driver probe. REG4A bit5 is reserved in V1.4,
+        never diagnosed as battery overcurrent. There is no reset attribute.
+        safe_mode_known=0 and battery_temperature_known=0 are explicit limits:
+        no verified Battery Safe Mode state bit or pack thermistor calibration.
+        A zero history is no observed fault, not a safety certification.
+        Related standard health reports Safety timer expire for observed timer
+        events, Over voltage for OVP, Unspecified failure for other observed
+        faults or live die thermal regulation, otherwise Good. It is sticky
+        history when an event has been observed, not a current battery-temperature
+        claim. Charge behaviour auto is refused with EPERM for observed faults
+        or thermal regulation, and fails on unreadable telemetry. Inhibition is
+        always available independently of fault telemetry. No getter clears IRQs,
+        resets the safety timer, or changes charger/protection policy.
+
+What: /sys/class/power_supply/axp20x-battery/die_temperature_millicelsius
+Date: November 2026
+Description:
+        Read-only PMIC die temperature in milli-degrees Celsius, not battery
+        temperature. X-Powers AXP2101 FAQ V1.0 section2.8: T=22+(7274-ADC)/20.
+        Reads the high byte before the low byte. ENODATA if ADC disabled,
+        raw zero or conversion outside -40..150 degrees; I/O errors propagate.
+        Probe enables only die ADC REG30 bit4 and restores its prior off state
+        on removal/probe failure. Already-enabled channels remain enabled.
+        This does not alter TS current source/monitoring, thermal thresholds,
+        battery detection or other ADC channels, and is not a calibrated probe.
+
+What: /sys/class/power_supply/axp20x-battery/ts_voltage_microvolts
+Date: November 2026
+Description:
+        Read-only TS pin ADC voltage at 500 microvolts/code, not battery Celsius.
+        ENODATA if ADC disabled, raw >=0x2000 (saturated/overflow; FAQ section2.12).
+        I/O errors propagate. TS current source, thermistor wiring/calibration
+        and charger coupling are separate; no temperature or pack presence can
+        be inferred from a plausible TS voltage. No TS control write is made.
+
+What: /sys/class/power_supply/axp20x-battery/charge_policy_control
+Date: November 2026
+Contact: Q2 Navidrome developers
+Description:
+ Read: version=1 epoch=<u64> generation=<u64> valid=<0|1>.
+ Epoch is fresh at each driver probe. valid=0 forbids conditional control.
+ Conditional authority is not published until all probe configuration succeeds.
+ Write: <epoch> <generation> <inhibit|auto|current> <value>.
+ inhibit/auto require value0; current uses an exactly representable microamp
+ limit within the existing DT maximum. AUTO retains the observed-fault guard.
+
+ Comparison and mutation share one driver mutex. Success consumes exactly one
+ generation; the writer owns the predictable input generation+1, never a token
+ obtained by a later read. An accepted hardware attempt which fails also
+ consumes the generation, so no failed operation grants a replayable token.
+ Reaching the final generation immediately publishes valid=0 (exhausted).
+ Stale epoch/generation returns ESTALE without a hardware mutation. Counter
+ exhaustion/unknown epoch return EOVERFLOW and keep conditional control closed.
+
+ Standard charge_behaviour and constant_charge_current remain available.
+ Every such legacy control attempt revokes previous policy authority, including
+ same-value inhibition and failed hardware writes. Existing limits/protections
+ remain unchanged and no IRQ status is cleared by the control interface.
+ The public token is an ownership/version check, not a credential or safety
+ certification. Reprobe/reset initialization rejects previously issued tokens.

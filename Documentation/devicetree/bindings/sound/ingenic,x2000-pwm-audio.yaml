@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/ingenic,x2000-pwm-audio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: PCM playback and tones through an Ingenic X2000 PWM channel
+
+maintainers:
+  - linux-mips@vger.kernel.org
+
+description: |
+  A buzzer or small speaker driven by one channel of the X2000 standalone
+  PWM controller. The channel plays mono PCM with looping PWM DMA, and
+  tones through an input device compatible with pwm-beeper.
+
+properties:
+  compatible:
+    const: ingenic,x2000-pwm-audio
+
+  pwms:
+    maxItems: 1
+
+  beeper-hz:
+    description: Frequency of the SND_BELL tone.
+    minimum: 10
+    maximum: 10000
+    default: 1000
+
+required:
+  - compatible
+  - pwms
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    clicker {
+        compatible = "ingenic,x2000-pwm-audio";
+        pwms = <&pwm 1 361794 0>;
+        beeper-hz = <2764>;
+    };

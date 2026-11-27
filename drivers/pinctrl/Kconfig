@@ -294,6 +294,7 @@ config PINCTRL_INGENIC
 	select GPIOLIB
 	select GPIOLIB_IRQCHIP
 	select REGMAP_MMIO
+	select MFD_SYSCON
 
 config PINCTRL_K210
 	bool "Pinctrl driver for the Canaan Kendryte K210 SoC"

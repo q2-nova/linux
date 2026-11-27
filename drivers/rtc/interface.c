@@ -510,6 +510,29 @@ static int __rtc_set_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 	return err;
 }
 
+static void rtc_alarm_note_change_locked(struct rtc_device *rtc)
+{
+	lockdep_assert_held(&rtc->ops_lock);
+	if (rtc->alarm_changes == U64_MAX)
+		rtc->alarm_events_overflow = true;
+	else
+		rtc->alarm_changes++;
+	if (rtc->alarm_changes == U64_MAX)
+		rtc->alarm_events_overflow = true;
+}
+
+static void rtc_alarm_note_event_locked(struct rtc_device *rtc)
+{
+	lockdep_assert_held(&rtc->ops_lock);
+	if (rtc->alarm_events == U64_MAX)
+		rtc->alarm_events_overflow = true;
+	else
+		rtc->alarm_events++;
+	if (rtc->alarm_events == U64_MAX)
+		rtc->alarm_events_overflow = true;
+	rtc->alarm_last_boottime_ns = ktime_get_boottime_ns();
+}
+
 int rtc_set_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 {
 	ktime_t alarm_time;
@@ -531,6 +554,7 @@ int rtc_set_alarm(struct rtc_device *rtc, struct rtc_wkalrm *alarm)
 	err = mutex_lock_interruptible(&rtc->ops_lock);
 	if (err)
 		return err;
+	rtc_alarm_note_change_locked(rtc);
 	if (rtc->aie_timer.enabled)
 		rtc_timer_remove(rtc, &rtc->aie_timer);
 
@@ -594,6 +618,7 @@ int rtc_alarm_irq_enable(struct rtc_device *rtc, unsigned int enabled)
 	if (err)
 		return err;
 
+	rtc_alarm_note_change_locked(rtc);
 	if (rtc->aie_timer.enabled != enabled) {
 		if (enabled)
 			err = rtc_timer_enqueue(rtc, &rtc->aie_timer);
@@ -703,6 +728,8 @@ void rtc_handle_legacy_irq(struct rtc_device *rtc, int num, int mode)
  */
 void rtc_aie_update_irq(struct rtc_device *rtc)
 {
+	/* rtc_timer_do_work holds ops_lock across the user AIE callback. */
+	rtc_alarm_note_event_locked(rtc);
 	rtc_handle_legacy_irq(rtc, 1, RTC_AF);
 }
 

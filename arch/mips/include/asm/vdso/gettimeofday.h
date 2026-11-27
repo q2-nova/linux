@@ -183,6 +183,25 @@ static __always_inline u64 read_gic_count(const struct vdso_time_data *data)
 
 #endif
 
+#ifdef CONFIG_INGENIC_X2000_OST
+
+/* GOST_CNTH 0x0c, GOST_CNTL 0x10; the same read as the kernel's. */
+static __always_inline u64 read_x2000_ost_count(const struct vdso_time_data *data)
+{
+	void __iomem *ost = get_x2000_ost(data);
+	u32 hi, hi2, lo;
+
+	do {
+		hi = __raw_readl(ost + 0x0c);
+		lo = __raw_readl(ost + 0x10);
+		hi2 = __raw_readl(ost + 0x0c);
+	} while (hi2 != hi);
+
+	return (((u64)hi) << 32) + lo;
+}
+
+#endif
+
 static __always_inline u64 __arch_get_hw_counter(s32 clock_mode,
 						 const struct vdso_time_data *vd)
 {
@@ -193,6 +212,10 @@ static __always_inline u64 __arch_get_hw_counter(s32 clock_mode,
 #ifdef CONFIG_CLKSRC_MIPS_GIC
 	if (clock_mode == VDSO_CLOCKMODE_GIC)
 		return read_gic_count(vd);
+#endif
+#ifdef CONFIG_INGENIC_X2000_OST
+	if (clock_mode == VDSO_CLOCKMODE_X2000_OST)
+		return read_x2000_ost_count(vd);
 #endif
 	/*
 	 * Core checks mode already. So this raced against a concurrent
@@ -205,7 +228,8 @@ static __always_inline u64 __arch_get_hw_counter(s32 clock_mode,
 static inline bool mips_vdso_hres_capable(void)
 {
 	return IS_ENABLED(CONFIG_CSRC_R4K) ||
-	       IS_ENABLED(CONFIG_CLKSRC_MIPS_GIC);
+	       IS_ENABLED(CONFIG_CLKSRC_MIPS_GIC) ||
+	       IS_ENABLED(CONFIG_INGENIC_X2000_OST);
 }
 #define __arch_vdso_hres_capable mips_vdso_hres_capable
 

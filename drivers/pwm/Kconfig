@@ -369,6 +369,15 @@ config PWM_IQS620A
 	  To compile this driver as a module, choose M here: the module will
 	  be called pwm-iqs620a.
 
+config PWM_INGENIC_X2000
+	tristate "Ingenic X2000 standalone PWM support"
+	depends on MACH_INGENIC || COMPILE_TEST
+	depends on COMMON_CLK
+	help
+	  Drive the 16-channel standalone PWM controller in the X2000.
+	  This supports periodic waveforms such as the Q2 backlight, and
+	  looping DMA waveform output for drivers such as PWM audio.
+
 config PWM_JZ4740
 	tristate "Ingenic JZ47xx PWM support"
 	depends on MACH_INGENIC || COMPILE_TEST

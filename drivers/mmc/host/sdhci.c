@@ -34,6 +34,140 @@
 
 #include "sdhci.h"
 
+#ifdef CONFIG_MIPS
+#include <asm/addrspace.h>
+#include <asm/io.h>
+
+/*
+ * Q2 debug: after a DMA read is unmapped, compare every lowmem segment's
+ * cached view with the same bytes through the uncached KSEG1 alias. A
+ * difference means a cache line the unmap did not invalidate (or a later
+ * write to the buffer). Off by default; dma_verify_stats reports the work.
+ */
+static bool dma_verify;
+module_param(dma_verify, bool, 0644);
+MODULE_PARM_DESC(dma_verify, "Debug: compare cached and uncached views of each DMA read segment after unmap (default 0)");
+
+static atomic_t sdhci_verify_segs = ATOMIC_INIT(0);
+static atomic_t sdhci_verify_mismatch = ATOMIC_INIT(0);
+static atomic_long_t sdhci_verify_bytes = ATOMIC_LONG_INIT(0);
+
+static int sdhci_verify_stats_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "segments=%d bytes=%ld mismatches=%d\n",
+			 atomic_read(&sdhci_verify_segs),
+			 atomic_long_read(&sdhci_verify_bytes),
+			 atomic_read(&sdhci_verify_mismatch));
+}
+
+static const struct kernel_param_ops sdhci_verify_stats_ops = {
+	.get = sdhci_verify_stats_get,
+};
+module_param_cb(dma_verify_stats, &sdhci_verify_stats_ops, NULL, 0444);
+MODULE_PARM_DESC(dma_verify_stats, "Segments and bytes compared by dma_verify, and mismatches");
+
+static void sdhci_dma_verify(struct mmc_host *mmc, struct mmc_data *data)
+{
+	struct scatterlist *sg;
+	int i;
+
+	if (!READ_ONCE(dma_verify) || !(data->flags & MMC_DATA_READ))
+		return;
+	for_each_sg(data->sg, sg, data->sg_len, i) {
+		struct page *page = sg_page(sg);
+		unsigned int words = sg->length / 4, n, b, nd = 0;
+		unsigned int first = 0, last = 0;
+		const u32 *cached, *uncached;
+		bool zero = true;
+		phys_addr_t phys;
+
+		if (PageHighMem(page) || ((sg->offset | sg->length) & 3))
+			continue;
+		phys = page_to_phys(page) + sg->offset;
+		cached = page_address(page) + sg->offset;
+		uncached = (const u32 *)CKSEG1ADDR(phys);
+		for (n = 0; n < words; n++) {
+			u32 c = READ_ONCE(cached[n]), u = READ_ONCE(uncached[n]);
+			u8 cb[4], ub[4];
+
+			if (c == u)
+				continue;
+			memcpy(cb, &c, 4);
+			memcpy(ub, &u, 4);
+			for (b = 0; b < 4; b++) {
+				if (cb[b] == ub[b])
+					continue;
+				if (!nd)
+					first = n * 4 + b;
+				last = n * 4 + b;
+				nd++;
+				if (cb[b])
+					zero = false;
+			}
+		}
+		atomic_inc(&sdhci_verify_segs);
+		atomic_long_add(sg->length, &sdhci_verify_bytes);
+		if (!nd)
+			continue;
+		atomic_inc(&sdhci_verify_mismatch);
+#ifdef MIPS_DMA_VERIFY_REPORT
+		/* dma_cache.verify_ring (arch/mips/mm/dma-noncoherent.c) */
+		mips_dma_verify_report(MIPS_DMA_VERIFY_SRC_SDHCI, phys, sg->length,
+				       first, last, nd, zero,
+				       MIPS_DMA_VERIFY_NONE);
+#else
+		pr_warn_ratelimited("%s: DMA read segment %d: cached and uncached views differ in %u bytes, %u to %u of %u (phys %pa), cpu %d\n",
+				    mmc_hostname(mmc), i, nd, first, last,
+				    sg->length, &phys, raw_smp_processor_id());
+#endif
+	}
+}
+#else
+static inline void sdhci_dma_verify(struct mmc_host *mmc, struct mmc_data *data) { }
+#endif
+
+/*
+ * Q2 diagnostic: pio_below (bytes, default 0 off). A data transfer of
+ * fewer bytes (blksz * blocks) uses PIO instead of SDMA/ADMA. sdhci_pre_req()
+ * does not pre-map such a request; one already pre-mapped (the parameter
+ * was written in between) keeps DMA, since the unmap of a mapping the CPU
+ * filled by PIO would invalidate the PIO data. path_stats counts data
+ * transfers by path: dma, pio (all PIO, also the quirk reverts) and
+ * pio_below (PIO because of pio_below). SDHCI_REQ_PIO_BELOW marks a request
+ * that pio_below alone kept off DMA, so sdhci_pre_req() still pre-maps the
+ * next request (it tests the previous request's SDHCI_REQ_USE_DMA).
+ */
+/* A host->flags bit sdhci.h does not define. */
+#define SDHCI_REQ_PIO_BELOW	(1<<30)
+static unsigned int pio_below;
+module_param(pio_below, uint, 0644);
+MODULE_PARM_DESC(pio_below, "Data transfers shorter than this many bytes use PIO instead of DMA (default 0: off)");
+
+static atomic_t sdhci_path_dma = ATOMIC_INIT(0);
+static atomic_t sdhci_path_pio = ATOMIC_INIT(0);
+static atomic_t sdhci_path_pio_below = ATOMIC_INIT(0);
+
+static int sdhci_path_stats_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "pio_below=%u dma=%d pio=%d pio_below_n=%d\n",
+			 READ_ONCE(pio_below), atomic_read(&sdhci_path_dma),
+			 atomic_read(&sdhci_path_pio),
+			 atomic_read(&sdhci_path_pio_below));
+}
+
+static const struct kernel_param_ops sdhci_path_stats_ops = {
+	.get = sdhci_path_stats_get,
+};
+module_param_cb(path_stats, &sdhci_path_stats_ops, NULL, 0444);
+MODULE_PARM_DESC(path_stats, "Data transfers by path (DMA, PIO, PIO because of pio_below)");
+
+static bool sdhci_pio_size(struct mmc_data *data)
+{
+	unsigned int below = READ_ONCE(pio_below);
+
+	return below && data->blksz * data->blocks < below;
+}
+
 #define DRIVER_NAME "sdhci"
 
 #define DBG(f, x...) \
@@ -1123,6 +1257,7 @@ void sdhci_prepare_dma(struct sdhci_host *host, struct mmc_data *data)
 		int i;
 
 		host->flags |= SDHCI_REQ_USE_DMA;
+		host->flags &= ~SDHCI_REQ_PIO_BELOW;
 
 		/*
 		 * FIXME: This doesn't account for merging when mapping the
@@ -1165,6 +1300,15 @@ void sdhci_prepare_dma(struct sdhci_host *host, struct mmc_data *data)
 				}
 			}
 		}
+
+		/* pio_below; never for a request sdhci_pre_req() mapped */
+		if ((host->flags & SDHCI_REQ_USE_DMA) &&
+		    data->host_cookie != COOKIE_PRE_MAPPED &&
+		    sdhci_pio_size(data)) {
+			host->flags &= ~SDHCI_REQ_USE_DMA;
+			host->flags |= SDHCI_REQ_PIO_BELOW;
+			atomic_inc(&sdhci_path_pio_below);
+		}
 	}
 
 	sdhci_config_dma(host);
@@ -1187,6 +1331,11 @@ void sdhci_prepare_dma(struct sdhci_host *host, struct mmc_data *data)
 			sdhci_set_sdma_addr(host, sdhci_sdma_address(host));
 		}
 	}
+
+	if (host->flags & SDHCI_REQ_USE_DMA)
+		atomic_inc(&sdhci_path_dma);
+	else
+		atomic_inc(&sdhci_path_pio);
 
 	if (!(host->flags & SDHCI_REQ_USE_DMA)) {
 		int flags;
@@ -3012,9 +3161,11 @@ static void sdhci_post_req(struct mmc_host *mmc, struct mmc_request *mrq,
 {
 	struct mmc_data *data = mrq->data;
 
-	if (data->host_cookie != COOKIE_UNMAPPED)
+	if (data->host_cookie != COOKIE_UNMAPPED) {
 		dma_unmap_sg(mmc_dev(mmc), data->sg, data->sg_len,
 			     mmc_get_dma_dir(data));
+		sdhci_dma_verify(mmc, data);
+	}
 
 	data->host_cookie = COOKIE_UNMAPPED;
 }
@@ -3030,7 +3181,8 @@ static void sdhci_pre_req(struct mmc_host *mmc, struct mmc_request *mrq)
 	 * for that we would need two bounce buffers since one buffer is
 	 * in flight when this is getting called.
 	 */
-	if (host->flags & SDHCI_REQ_USE_DMA && !host->bounce_buffer)
+	if (host->flags & (SDHCI_REQ_USE_DMA | SDHCI_REQ_PIO_BELOW) &&
+	    !host->bounce_buffer && !sdhci_pio_size(mrq->data))
 		sdhci_pre_dma_transfer(host, mrq->data, COOKIE_PRE_MAPPED);
 }
 
@@ -3140,6 +3292,7 @@ void sdhci_request_done_dma(struct sdhci_host *host, struct mmc_request *mrq)
 			dma_unmap_sg(mmc_dev(host->mmc), data->sg,
 				     data->sg_len,
 				     mmc_get_dma_dir(data));
+			sdhci_dma_verify(host->mmc, data);
 		}
 		data->host_cookie = COOKIE_UNMAPPED;
 	}

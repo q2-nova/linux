@@ -1,0 +1,615 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Shanling Q2 portable music player (Ingenic X2000, 128 MiB).
+ *
+ * Board wiring from the stock firmware's device tree and the parameters its
+ * board modules are loaded with.
+ */
+/dts-v1/;
+
+#include "x2000.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/input/gpio-keys.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	model = "Shanling Q2";
+	compatible = "shanling,q2", "ingenic,x2000";
+
+	aliases {
+		serial0 = &uart0;
+		i2c0 = &i2c0;
+		i2c2 = &i2c2;
+		i2c3 = &i2c3;
+		i2c5 = &i2c5;
+		i2c6 = &pmic_i2c;
+		mmc0 = &msc2;
+		mmc1 = &msc1;
+		serial3 = &uart3;
+	};
+
+	chosen {
+		stdout-path = "serial3:115200n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x8000000>;
+	};
+
+	/* Retained only across resets that preserve DDR; not power removal. */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		ramoops@7d00000 {
+			compatible = "ramoops";
+			reg = <0x07d00000 0x00100000>;
+			record-size = <0x00010000>;
+			console-size = <0x00040000>;
+			pmsg-size = <0x00010000>;
+			ecc-size = <16>;
+		};
+	};
+
+	cpu-scaling {
+		compatible = "shanling,q2-cpufreq";
+		clocks = <&cgu X2000_CLK_CPU>, <&cgu X2000_CLK_L2CACHE>,
+			 <&cgu X2000_CLK_CPUMUX>;
+		clock-names = "cpu", "l2", "parent";
+	};
+
+	battery: battery {
+		compatible = "simple-battery";
+		/* Stock pmu_init_chgvol = 4350 mV. */
+		constant-charge-voltage-max-microvolt = <4350000>;
+		/* Exact stock DT/probe values, corroborated by physical readback. */
+		constant-charge-current-max-microamp = <1000000>;
+		precharge-current-microamp = <100000>;
+		charge-term-current-microamp = <100000>;
+	};
+
+	pmic_i2c: i2c-pmic {
+		compatible = "i2c-gpio";
+		sda-gpios = <&gpc 24 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&gpc 23 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		pmic: pmic@34 {
+			compatible = "x-powers,axp2101";
+			reg = <0x34>;
+			axp_usb: usb-power-supply {
+				compatible = "x-powers,axp2101-usb-power-supply";
+			};
+			battery-power-supply {
+				compatible = "x-powers,axp2101-battery-power-supply";
+				monitored-battery = <&battery>;
+				power-supplies = <&axp_usb>;
+			};
+			regulators {
+				aldo1: aldo1 {
+					/* Required for the combo chip to answer on SDIO. */
+					regulator-name = "axp2101-aldo1";
+					regulator-min-microvolt = <1800000>;
+					regulator-max-microvolt = <1800000>;
+					regulator-always-on;
+				};
+				aldo2: aldo2 {
+					regulator-name = "axp2101-aldo2";
+					regulator-min-microvolt = <2800000>;
+					regulator-max-microvolt = <2800000>;
+				};
+				aldo3: aldo3 {
+					regulator-name = "axp2101-aldo3";
+					regulator-min-microvolt = <2800000>;
+					regulator-max-microvolt = <2800000>;
+				};
+				aldo4: aldo4 {
+					regulator-name = "axp2101-aldo4";
+					regulator-min-microvolt = <3300000>;
+					regulator-max-microvolt = <3300000>;
+				};
+				/* Constraints from the stock Q2 DT, not the R1 board. */
+				dcdc1 {
+					regulator-name = "axp2101-dcdc1";
+					regulator-min-microvolt = <1500000>;
+					regulator-max-microvolt = <3400000>;
+					regulator-always-on;
+				};
+				dcdc2 {
+					regulator-name = "axp2101-dcdc2";
+					regulator-min-microvolt = <1200000>;
+					regulator-max-microvolt = <1200000>;
+					regulator-always-on;
+				};
+				dcdc3 {
+					regulator-name = "axp2101-dcdc3";
+					regulator-min-microvolt = <500000>;
+					regulator-max-microvolt = <3400000>;
+					regulator-always-on;
+				};
+				dcdc4 {
+					regulator-name = "axp2101-dcdc4";
+					regulator-min-microvolt = <950000>;
+					regulator-max-microvolt = <950000>;
+					regulator-always-on;
+				};
+				rtcldo {
+					regulator-name = "axp2101-rtcldo";
+					regulator-always-on;
+				};
+				bldo1: bldo1 {
+					regulator-name = "axp2101-bldo1";
+					regulator-min-microvolt = <1800000>;
+					regulator-max-microvolt = <1800000>;
+					regulator-always-on;
+				};
+				bldo2: bldo2 {
+					regulator-name = "axp2101-bldo2";
+					regulator-min-microvolt = <3300000>;
+					regulator-max-microvolt = <3300000>;
+					regulator-always-on;
+				};
+			};
+		};
+	};
+
+	/*
+	 * Stock MCU drives PC1/PWM1 with a 2 ms, 50% duty click. Mainline
+	 * plays PCM and tones on it with looping PWM DMA.
+	 */
+	clicker {
+		compatible = "ingenic,x2000-pwm-audio";
+		pwms = <&pwm 1 361794 0>;
+		beeper-hz = <2764>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pwm1_pins>;
+	};
+
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&pwm 0 100000 0>;
+		/* One distinct PWM level per app percentage; retain the lit minimum. */
+		brightness-levels = <
+			0 16 18 21 23 26 28 30 33 35 38 40
+			43 45 47 50 52 55 57 59 62 64 67 69
+			72 74 76 79 81 84 86 88 91 93 96 98
+			100 103 105 108 110 113 115 117 120 122 125 127
+			129 132 134 137 139 142 144 146 149 151 154 156
+			158 161 163 166 168 171 173 175 178 180 183 185
+			187 190 192 195 197 199 202 204 207 209 212 214
+			216 219 221 224 226 228 231 233 236 238 241 243
+			245 248 250 253 255
+		>;
+		default-brightness-level = <0>;
+	};
+
+	keys {
+		compatible = "gpio-keys";
+		label = "Q2 buttons";
+		linux,suspend-input-guard;
+		switch-headphones {
+			label = "headphones-3.5mm";
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_HEADPHONE_INSERT>;
+			gpios = <&gpa 7 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+		switch-lineout {
+			label = "headphones-4.4mm";
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_LINEOUT_INSERT>;
+			gpios = <&gpa 8 GPIO_ACTIVE_LOW>;
+			debounce-interval = <20>;
+		};
+		button-power {
+			label = "power";
+			linux,code = <KEY_POWER>;
+			wakeup-source;
+			wakeup-event-action = <EV_ACT_ASSERTED>;
+			gpios = <&gpe 31 GPIO_ACTIVE_LOW>;
+			debounce-interval = <10>;
+		};
+		button-return {
+			label = "return";
+			linux,code = <KEY_UP>;
+			gpios = <&gpb 18 GPIO_ACTIVE_LOW>;
+			debounce-interval = <10>;
+		};
+		button-play {
+			label = "play";
+			linux,code = <KEY_DOWN>;
+			gpios = <&gpb 17 GPIO_ACTIVE_LOW>;
+			debounce-interval = <10>;
+		};
+		button-previous {
+			label = "previous";
+			linux,code = <KEY_PREVIOUSSONG>;
+			gpios = <&gpb 16 GPIO_ACTIVE_LOW>;
+			debounce-interval = <10>;
+		};
+		button-next {
+			label = "next";
+			linux,code = <KEY_NEXTSONG>;
+			gpios = <&gpe 26 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <10>;
+		};
+	};
+
+	vcc_sd: regulator-sd {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-sd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&gpa 12 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	/*
+	 * RTL8733BS Wi-Fi/Bluetooth combo on MSC1. The stock rtl8733bs.ko
+	 * (rtk_wlan_bt_power_ctrl, rtk_wlan_power_ctrl) drives BT_DIS_N (PD20)
+	 * high, waits 10 ms, drives WL_DIS_N (PD01) high, then rescans MSC1;
+	 * after dropping WL_DIS_N it waits 100 ms. Both enables are active
+	 * high. Model them as a supply chain so the MMC core keeps that order:
+	 * enabling the slot supply raises BT_DIS_N first. mmc-pwrseq-simple is
+	 * not used: with one reset GPIO it takes a shared reset control and
+	 * pulses WL_DIS_N high before every power-up, which stock never does.
+	 * A Bluetooth driver can share the BT_DIS_N supply.
+	 */
+	wifi_pwrseq: wifi-pwrseq {
+		compatible = "shanling,q2-wifi-pwrseq";
+		aldo1-supply = <&aldo1>;
+		bldo1-supply = <&bldo1>;
+		bldo2-supply = <&bldo2>;
+	};
+
+	wlan_bt_en: regulator-wlan-bt {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-bt-en";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&gpd 20 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <10000>;
+	};
+
+	wlan_en: regulator-wlan {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-en";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&gpd 1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		vin-supply = <&wlan_bt_en>;
+		off-on-delay-us = <100000>;
+	};
+};
+
+/ {
+	/*
+	 * BT_DIS_N (PD20) a second time, for Bluetooth alone. The Wi-Fi slot's
+	 * supply chain raises the same line through wlan_bt_en; fixed regulators
+	 * share an enable GPIO by reference count, so the line stays high while
+	 * either holds it. Userspace holds this one while Bluetooth is on:
+	 * echo enabled > /sys/devices/platform/bt-power/state
+	 */
+	bt_en: regulator-bt {
+		compatible = "regulator-fixed";
+		regulator-name = "bt-en";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&gpd 20 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <10000>;
+	};
+
+	bt-power {
+		compatible = "regulator-output";
+		vout-supply = <&bt_en>;
+	};
+};
+
+/*
+ * The RTL8733BS's Bluetooth HCI: stock runs "rtk_hciattach -s 115200 ttyS0
+ * rtk_h5" on UART0 and its configuration file asks for hardware flow
+ * control, so all four lines are muxed. q2nd drives the port from userspace.
+ */
+&uart0 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart0_pins>;
+};
+
+&pinctrl {
+	uart0_pins: uart0-pins {
+		function = "uart0";
+		groups = "uart0-data", "uart0-hwflow";
+	};
+};
+
+&uart3 {
+	status = "okay";
+};
+
+&pinctrl {
+	/* Stock ingenic,gpa_voltage=<1>; PA12 enables the 3.3 V card supply. */
+	ingenic,gpa-voltage-microvolt = <1800000>;
+
+	sfc_pins: sfc-pins {
+		function = "sfc";
+		groups = "sfc-data-if0-e", "sfc-clk-e", "sfc-ce-e";
+	};
+	i2c0_pins: i2c0-pins {
+		function = "i2c0";
+		groups = "i2c0-data";
+	};
+	i2c2_pins: i2c2-pins {
+		function = "i2c2";
+		groups = "i2c2-data-b";
+	};
+	i2c3_pins: i2c3-pins {
+		function = "i2c3";
+		groups = "i2c3-data-a";
+	};
+	i2c5_pins: i2c5-pins {
+		function = "i2c5";
+		groups = "i2c5-data-d";
+	};
+	msc1_pins: mmc1-pins {
+		function = "mmc1";
+		groups = "mmc1-1bit", "mmc1-4bit";
+	};
+	msc2_pins: mmc2-pins {
+		function = "mmc2";
+		groups = "mmc2-1bit", "mmc2-4bit";
+		bias-pull-up;
+	};
+	msc2_sleep_pins: mmc2-sleep-pins {
+		pins = "PE0", "PE1", "PE2", "PE3", "PE4", "PE5";
+		bias-high-impedance;
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c0_pins>;
+	clock-frequency = <200000>;
+	battery-gauge@62 {
+		compatible = "cellwise,cw2015";
+		power-supplies = <&axp_usb>;
+		reg = <0x62>;
+	};
+};
+
+&i2c2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c2_pins>;
+	clock-frequency = <200000>;
+	wheel@15 {
+		compatible = "shanling,q2-wheel";
+		linux,suspend-input-guard;
+		reg = <0x15>;
+		interrupt-parent = <&gpb>;
+		interrupts = <21 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&gpb 20 GPIO_ACTIVE_LOW>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c3_pins>;
+	clock-frequency = <200000>;
+
+	touchscreen@15 {
+		compatible = "shanling,q2-touchscreen";
+		reg = <0x15>;
+		interrupt-parent = <&gpa>;
+		interrupts = <15 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&gpa 14 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&aldo3>;
+	};
+};
+
+&i2c5 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c5_pins>;
+	clock-frequency = <400000>;
+};
+
+/* soc_msc.sh: msc1 non-removable, 4-bit SDIO, keep power in suspend. */
+&msc1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&msc1_pins>;
+	mmc-pwrseq = <&wifi_pwrseq>;
+	vmmc-supply = <&wlan_en>;
+	bus-width = <4>;
+	non-removable;
+	keep-power-in-suspend;
+	cap-sd-highspeed;
+	no-1-8-v;
+	/* Stock allows 100 MHz; start at high speed until hardware tests. */
+	max-frequency = <50000000>;
+};
+
+&msc2 {
+	status = "okay";
+	pinctrl-names = "default", "sleep";
+	pinctrl-0 = <&msc2_pins>;
+	pinctrl-1 = <&msc2_sleep_pins>;
+	vmmc-supply = <&vcc_sd>;
+	bus-width = <4>;
+	broken-cd;
+	cap-sd-highspeed;
+	no-1-8-v;
+	/* Start conservatively; UHS tuning needs hardware validation. */
+	max-frequency = <50000000>;
+};
+
+&sfc {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&sfc_pins>;
+	flash@0 {
+		compatible = "spi-nand";
+		reg = <0>;
+		spi-max-frequency = <25000000>;
+		spi-rx-bus-width = <4>;
+		spi-tx-bus-width = <4>;
+		/* Partition discovery remains external: do not guess device layout. */
+	};
+};
+
+&pwm {
+	assigned-clocks = <&cgu X2000_CLK_PWM>;
+	assigned-clock-parents = <&cgu X2000_CLK_MPLL>;
+	assigned-clock-rates = <50000000>;
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&pwm0_pins>;
+};
+
+&pinctrl {
+	pwm1_pins: pwm1-pins {
+		function = "pwm1";
+		groups = "pwm1-c";
+	};
+	pwm0_pins: pwm0-pins {
+		function = "pwm0";
+		groups = "pwm0-c";
+	};
+};
+
+&dpu { status = "okay"; };
+&dsi {
+	status = "okay";
+	panel@0 {
+		compatible = "shanling,q2-h0209s";
+		reg = <0>;
+		reset-gpios = <&gpa 13 GPIO_ACTIVE_LOW>;
+		vdd28-supply = <&aldo2>;
+		vdd33-supply = <&aldo4>;
+		backlight = <&backlight>;
+		port { panel_in: endpoint { remote-endpoint = <&dsi_out>; }; };
+	};
+	ports {
+		port@1 { reg = <1>; dsi_out: endpoint { remote-endpoint = <&panel_in>; }; };
+	};
+};
+
+/ {
+	/* PB1 is the stock DAC enable. Individual downstream rail topology
+	 * and voltages remain unqualified; do not invent voltage constraints.
+	 */
+	dac_power: regulator-dac {
+		compatible = "regulator-fixed";
+		regulator-name = "dac-power";
+		gpio = <&gpb 1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <50000>;
+	};
+
+	sound {
+		compatible = "shanling,q2-audio";
+		audio-controller = <&audio>;
+		audio-codecs = <&dac0>, <&dac1>, <&dac2>, <&dac3>;
+		mute-gpios = <&gpb 10 GPIO_ACTIVE_HIGH>;
+		mode-gpios = <&gpb 9 GPIO_ACTIVE_HIGH>;
+		boost-gpios = <&gpb 2 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&pinctrl {
+	i2s1_pins: i2s1-pins {
+		function = "i2s1";
+		groups = "i2s1-data-tx", "i2s1-clk-tx", "i2s1-sysclk-tx";
+	};
+};
+
+&audio {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2s1_pins>;
+};
+
+&i2c5 {
+	dac0: audio-codec@30 {
+		compatible = "cirrus,cs43131";
+		reg = <0x30>;
+		/* Board reset is inverted relative to the IC's RESET pin. */
+		reset-gpios = <&gpb 14 GPIO_ACTIVE_HIGH>;
+		cirrus,shared-reset;
+		VA-supply = <&dac_power>;
+		VP-supply = <&dac_power>;
+		VL-supply = <&dac_power>;
+		VCP-supply = <&dac_power>;
+		VD-supply = <&dac_power>;
+	};
+	dac1: audio-codec@31 {
+		compatible = "cirrus,cs43131";
+		reg = <0x31>;
+		/* Board reset is inverted relative to the IC's RESET pin. */
+		reset-gpios = <&gpb 14 GPIO_ACTIVE_HIGH>;
+		cirrus,shared-reset;
+		VA-supply = <&dac_power>;
+		VP-supply = <&dac_power>;
+		VL-supply = <&dac_power>;
+		VCP-supply = <&dac_power>;
+		VD-supply = <&dac_power>;
+	};
+	dac2: audio-codec@32 {
+		compatible = "cirrus,cs43131";
+		reg = <0x32>;
+		/* Board reset is inverted relative to the IC's RESET pin. */
+		reset-gpios = <&gpb 14 GPIO_ACTIVE_HIGH>;
+		cirrus,shared-reset;
+		VA-supply = <&dac_power>;
+		VP-supply = <&dac_power>;
+		VL-supply = <&dac_power>;
+		VCP-supply = <&dac_power>;
+		VD-supply = <&dac_power>;
+	};
+	dac3: audio-codec@33 {
+		compatible = "cirrus,cs43131";
+		reg = <0x33>;
+		/* Board reset is inverted relative to the IC's RESET pin. */
+		reset-gpios = <&gpb 14 GPIO_ACTIVE_HIGH>;
+		cirrus,shared-reset;
+		VA-supply = <&dac_power>;
+		VP-supply = <&dac_power>;
+		VL-supply = <&dac_power>;
+		VCP-supply = <&dac_power>;
+		VD-supply = <&dac_power>;
+	};
+};
+
+&usbphy {
+	status = "okay";
+};
+
+&otg {
+	status = "okay";
+	dr_mode = "peripheral";
+};
+
+/* Q2 INSTALL PROFILE */
+&pinctrl { install_clk32k: install-clk32k { function = "clk32k"; groups = "clk32k"; }; };
+&msc1 { pinctrl-0 = <&msc1_pins &install_clk32k>; };
+/ { chosen { bootargs = "console=ttyS3,115200 clk_ignore_unused panic=10 q2.hardware=1 q2.installed=1"; }; };
+&sfc { status = "okay"; flash@0 {
+    /delete-node/ partitions;
+    partitions {
+        compatible = "fixed-partitions";
+        #address-cells = <1>; #size-cells = <1>;
+        partition@700000 { label = "rootfs"; reg = <0x700000 0x4b00000>; read-only; };
+        partition@6420000 { label = "ota"; reg = <0x6420000 0x20000>; };
+        partition@6440000 { label = "userdata"; reg = <0x6440000 0x18c0000>; };
+    };
+}; };

@@ -85,6 +85,26 @@ config INGENIC_CGU_X1830
 
 	  If building for a X1830 SoC, you want to say Y here.
 
+config INGENIC_CGU_X2000
+	bool "Ingenic X2000 CGU driver"
+	default MACH_X2000
+	select INGENIC_CGU_COMMON
+	select RATIONAL
+	help
+	  Support the clocks provided by the CGU hardware on Ingenic X2000
+	  and compatible SoCs.
+
+	  If building for a X2000 SoC, you want to say Y here.
+
+config INGENIC_X2000_POWER_DOMAINS
+	bool "Ingenic X2000 accelerator power domains"
+	depends on INGENIC_CGU_X2000 && OF && PM
+	select PM_GENERIC_DOMAINS
+	help
+	  Manage the ISP0, ISP1, FELIX and HELIX power switches separately
+	  from clock gating, with bounded acknowledgements and rollback.
+	  CPU, DDR and peripheral SRAM are not controlled by this driver.
+
 config INGENIC_TCU_CLK
 	bool "Ingenic JZ47xx TCU clocks driver"
 	default MACH_INGENIC

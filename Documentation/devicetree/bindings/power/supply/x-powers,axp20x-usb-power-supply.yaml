@@ -25,6 +25,7 @@ properties:
           - x-powers,axp223-usb-power-supply
           - x-powers,axp717-usb-power-supply
           - x-powers,axp813-usb-power-supply
+          - x-powers,axp2101-usb-power-supply
       - items:
           - const: x-powers,axp803-usb-power-supply
           - const: x-powers,axp813-usb-power-supply
@@ -41,6 +42,15 @@ required:
   - compatible
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: x-powers,axp2101-usb-power-supply
+    then:
+      properties:
+        input-current-limit-microamp: false
+
   - $ref: power-supply.yaml#
   - if:
       properties:

@@ -252,6 +252,8 @@ struct exfat_sb_info {
 	struct exfat_mount_options options;
 	struct nls_table *nls_io; /* Charset used for input and display */
 	struct ratelimit_state ratelimit;
+	/* dir.c dentry_diag: the buffer dump ran on this mount */
+	bool dentry_diag_done;
 
 	spinlock_t inode_hash_lock;
 	struct hlist_head inode_hashtable[EXFAT_HASH_SIZE];

@@ -522,6 +522,14 @@ config SPI_INGENIC
 	  To compile this driver as a module, choose M here: the module
 	  will be called spi-ingenic.
 
+config SPI_INGENIC_SFC
+	tristate "Ingenic X2000 serial flash controller"
+	depends on MACH_INGENIC_SOC || COMPILE_TEST
+	depends on OF && COMMON_CLK
+	select SPI_MEM
+	help
+	  Interrupt-driven PIO support for SPI memories on the X2000 SFC.
+
 config SPI_INTEL
 	tristate
 

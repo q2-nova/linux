@@ -9,6 +9,7 @@
  * Copyright (C) 2001, 2012 MIPS Technologies, Inc.  All rights reserved.
  */
 #include <linux/init.h>
+#include <linux/q2-pm-general-trace.h>
 
 #include <asm/asm.h>
 #include <asm/asmmacro.h>
@@ -30,6 +31,39 @@
  * to fit into space reserved for the exception handler.
  */
 NESTED(except_vec3_generic, 0, sp)
+#if defined(CONFIG_MACH_INGENIC) && defined(CONFIG_32BIT)
+	/* Q2 inactive diagnostic:24 words, K0/K1 only; gate zero before PM init. */
+	.set push
+	.set noat
+	.set noreorder
+	lui k0, %hi(q2_general_trace_enable)
+	lw k1, %lo(q2_general_trace_enable)(k0)
+	beqz k1, .Lq2_general_done
+	 lui k0, %hi(q2_refill_trace_enable)
+	/* Close late first-refill capture before the first general frame. */
+	sw zero, %lo(q2_refill_trace_enable)(k0)
+	lui k0, 0xb240
+	mfc0 k1, CP0_EPC
+	sw k1, Q2_GT_OFFSET+32(k0)
+	nor k1, k1, zero
+	sw k1, Q2_GT_OFFSET+44(k0)
+	mfc0 k1, CP0_BADVADDR
+	sw k1, Q2_GT_OFFSET+36(k0)
+	nor k1, k1, zero
+	sw k1, Q2_GT_OFFSET+48(k0)
+	mfc0 k1, CP0_CAUSE
+	sw k1, Q2_GT_OFFSET+40(k0)
+	nor k1, k1, zero
+	sw k1, Q2_GT_OFFSET+52(k0)
+	sync
+	ori k1, zero, Q2_GT_ENTRY
+	sw k1, Q2_GT_OFFSET+24(k0)
+	lw k1, Q2_GT_OFFSET+24(k0)
+	lui k0, %hi(q2_general_trace_enable)
+	sw zero, %lo(q2_general_trace_enable)(k0)
+.Lq2_general_done:
+	.set pop
+#endif
 	.set	push
 	.set	noat
 	mfc0	k1, CP0_CAUSE
@@ -550,6 +584,16 @@ NESTED(nmi_handler, PT_SIZE, sp)
 	NESTED(handle_\exception, PT_SIZE, sp)
 	.cfi_signal_frame
 	.set	noat
+#if defined(CONFIG_MACH_INGENIC) && defined(CONFIG_32BIT)
+	.ifc \exception,tr
+	.set push
+	.set noreorder
+	j q2_pm_trap_fixup
+	 nop
+FEXPORT(q2_pm_trap_fallback)
+	.set pop
+	.endif
+#endif
 	SAVE_ALL
 	FEXPORT(handle_\exception\ext)
 	__build_clear_\clear
@@ -564,6 +608,51 @@ NESTED(nmi_handler, PT_SIZE, sp)
 	.macro	BUILD_HANDLER exception handler clear verbose
 	__BUILD_HANDLER \exception \handler \clear \verbose _int
 	.endm
+
+#if defined(CONFIG_MACH_INGENIC) && defined(CONFIG_32BIT)
+/* Inactive owned Trap discriminator. Preserve all ordinary GPRs and match the
+ * exact one-shot builtin fault before bypassing SAVE_ALL/STI. Unmatched entries
+ * retain the original handler. No software EXL cycle is added to this arm. */
+	.set push
+	.set noat
+	.set noreorder
+LEAF(q2_pm_trap_fixup)
+	lui k0, %hi(q2_pm_trap_gate)
+	lw k1, %lo(q2_pm_trap_gate)(k0)
+	xori k1, k1, 1
+	bnez k1, .Lq2_trap_unmatched
+	 nop
+	mfc0 k1, CP0_CAUSE
+	bltz k1, .Lq2_trap_unmatched
+	 nop
+	andi k1, k1, 0x7c
+	xori k1, k1, 52
+	bnez k1, .Lq2_trap_unmatched
+	 nop
+	mfc0 k1, CP0_STATUS
+	andi k1, k1, 7
+	xori k1, k1, 2
+	bnez k1, .Lq2_trap_unmatched
+	 nop
+	mfc0 k0, CP0_EPC
+	lui k1, %hi(q2_pm_trap_fault)
+	addiu k1, k1, %lo(q2_pm_trap_fault)
+	bne k0, k1, .Lq2_trap_unmatched
+	 nop
+	lui k0, %hi(q2_pm_trap_gate)
+	sw zero, %lo(q2_pm_trap_gate)(k0)
+	sync
+	la k0, q2_pm_exl_keep
+	mtc0 k0, CP0_EPC
+	ehb
+	eret
+	 nop
+.Lq2_trap_unmatched:
+	j q2_pm_trap_fallback
+	 nop
+	END(q2_pm_trap_fixup)
+	.set pop
+#endif
 
 	BUILD_HANDLER adel ade ade silent		/* #4  */
 	BUILD_HANDLER ades ade ade silent		/* #5  */

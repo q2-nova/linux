@@ -450,6 +450,8 @@ config MACH_INGENIC_SOC
 	select SYS_SUPPORTS_ZBOOT_UART16550
 	select CPU_SUPPORTS_CPUFREQ
 	select MIPS_EXTERNAL_TIMER
+	# XBurst L2 is described in Config2; without this setup_scache() panics.
+	select MIPS_CPU_SCACHE
 
 config LANTIQ
 	bool "Lantiq based platforms"
@@ -3160,7 +3162,7 @@ config MIPS_EXTERNAL_TIMER
 config MIPS_GENERIC_GETTIMEOFDAY
 	def_bool y
 	select GENERIC_GETTIMEOFDAY
-	depends on CSRC_R4K || CLKSRC_MIPS_GIC
+	depends on CSRC_R4K || CLKSRC_MIPS_GIC || INGENIC_X2000_OST
 	# GCC (at least up to version 9.2) appears to emit function calls that make use
 	# of the GOT when targeting microMIPS, which we can't use in the VDSO due to
 	# the lack of relocations. As such, we disable the VDSO for microMIPS builds.

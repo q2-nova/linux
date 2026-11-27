@@ -263,6 +263,13 @@ source "drivers/cpufreq/Kconfig.powerpc"
 endif
 
 if MIPS
+config Q2_CPUFREQ
+	bool "Shanling Q2 shared CPU/L2 divider scaling"
+	depends on MACH_INGENIC && COMMON_CLK && OF
+	help
+	  Scale the shared CPU/L2 clock using dividers of the fixed 1200 MHz
+	  CPU parent. Does not change PLLs, peripheral clocks or voltages.
+
 config BMIPS_CPUFREQ
 	tristate "BMIPS CPUfreq Driver"
 	help

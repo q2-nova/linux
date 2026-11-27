@@ -6,12 +6,14 @@
  *
  * Authors: Li Xu <li.xu@cirrus.com>
  */
+#include <linux/reset.h>
 #include <linux/cleanup.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/delay.h>
+#include <linux/ktime.h>
 #include <linux/gpio/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
@@ -810,34 +812,49 @@ static int cs43130_pcm_dsd_mix(bool en, struct regmap *regmap)
 	return 0;
 }
 
+static int cs43130_hw_free(struct snd_pcm_substream *substream,
+			   struct snd_soc_dai *dai);
+
+static int cs43130_acquire_clock(struct snd_soc_dai *dai, unsigned int rate)
+{
+	struct snd_soc_component *component = dai->component;
+	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
+	struct cs43130_dai *port = &cs43130->dais[dai->id];
+	unsigned int required = CS43130_MCLK_22M % rate ?
+				CS43130_MCLK_24M : CS43130_MCLK_22M;
+	int ret;
+
+	guard(mutex)(&cs43130->clk_mutex);
+	if (!cs43130->clk_req || (port->clock_acquired && cs43130->clk_req == 1)) {
+		ret = cs43130_set_pll(component, 0, 0, cs43130->mclk, required);
+		if (ret)
+			return ret;
+		ret = cs43130_change_clksrc(component, cs43130->pll_bypass ?
+					   CS43130_MCLK_SRC_EXT : CS43130_MCLK_SRC_PLL);
+		if (ret) {
+			cs43130_change_clksrc(component, CS43130_MCLK_SRC_RCO);
+			return ret;
+		}
+	} else if (cs43130->mclk_int != required) {
+		return -EBUSY;
+	}
+	if (!port->clock_acquired) {
+		cs43130->clk_req++;
+		port->clock_acquired = true;
+		if (cs43130->clk_req == 2)
+			cs43130_pcm_dsd_mix(true, cs43130->regmap);
+	}
+	return 0;
+}
+
 static int cs43130_dsd_hw_params(struct snd_pcm_substream *substream,
 				 struct snd_pcm_hw_params *params,
 				 struct snd_soc_dai *dai)
 {
 	struct snd_soc_component *component = dai->component;
 	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
-	unsigned int required_clk;
+	int ret;
 	u8 dsd_speed;
-
-	scoped_guard(mutex, &cs43130->clk_mutex) {
-		if (!cs43130->clk_req) {
-			/* no DAI is currently using clk */
-			if (!(CS43130_MCLK_22M % params_rate(params)))
-				required_clk = CS43130_MCLK_22M;
-			else
-				required_clk = CS43130_MCLK_24M;
-
-			cs43130_set_pll(component, 0, 0, cs43130->mclk, required_clk);
-			if (cs43130->pll_bypass)
-				cs43130_change_clksrc(component, CS43130_MCLK_SRC_EXT);
-			else
-				cs43130_change_clksrc(component, CS43130_MCLK_SRC_PLL);
-		}
-
-		cs43130->clk_req++;
-		if (cs43130->clk_req == 2)
-			cs43130_pcm_dsd_mix(true, cs43130->regmap);
-	}
 
 	switch (params_rate(params)) {
 	case 176400:
@@ -851,6 +868,10 @@ static int cs43130_dsd_hw_params(struct snd_pcm_substream *substream,
 			params_rate(params));
 		return -EINVAL;
 	}
+
+	ret = cs43130_acquire_clock(dai, params_rate(params));
+	if (ret)
+		return ret;
 
 	if (cs43130->dais[dai->id].dai_mode == SND_SOC_DAIFMT_CBP_CFP)
 		regmap_update_bits(cs43130->regmap, CS43130_DSD_INT_CFG,
@@ -879,28 +900,15 @@ static int cs43130_hw_params(struct snd_pcm_substream *substream,
 	unsigned int sclk = cs43130->dais[dai->id].sclk;
 	unsigned int bitwidth_sclk;
 	unsigned int bitwidth_dai = (unsigned int)(params_width(params));
-	unsigned int required_clk;
+	int ret;
 	u8 dsd_speed;
 
-	scoped_guard(mutex, &cs43130->clk_mutex) {
-		if (!cs43130->clk_req) {
-			/* no DAI is currently using clk */
-			if (!(CS43130_MCLK_22M % params_rate(params)))
-				required_clk = CS43130_MCLK_22M;
-			else
-				required_clk = CS43130_MCLK_24M;
-
-			cs43130_set_pll(component, 0, 0, cs43130->mclk, required_clk);
-			if (cs43130->pll_bypass)
-				cs43130_change_clksrc(component, CS43130_MCLK_SRC_EXT);
-			else
-				cs43130_change_clksrc(component, CS43130_MCLK_SRC_PLL);
-		}
-
-		cs43130->clk_req++;
-		if (cs43130->clk_req == 2)
-			cs43130_pcm_dsd_mix(true, cs43130->regmap);
-	}
+	/* DAPM teardown reports errors but still completes cleanup. Do not
+	 * silently reuse a codec whose completion was never observed.
+	 * This fault is cleared by reprobe, not an unverified retry.
+	 */
+	if (cs43130->pdn_failed)
+		return -EIO;
 
 	switch (dai->id) {
 	case CS43130_ASP_DOP_DAI:
@@ -977,10 +985,15 @@ static int cs43130_hw_params(struct snd_pcm_substream *substream,
 		"bitwidth_sclk = %u, num_ch = %u\n",
 		bitwidth_sclk, params_channels(params));
 
-	cs43130_set_bitwidth(dai->id, bitwidth_dai, cs43130->regmap);
-	cs43130_set_sp_fmt(dai->id, bitwidth_sclk, params, cs43130);
-
-	return 0;
+	ret = cs43130_acquire_clock(dai, params_rate(params));
+	if (ret)
+		return ret;
+	ret = cs43130_set_bitwidth(dai->id, bitwidth_dai, cs43130->regmap);
+	if (!ret)
+		ret = cs43130_set_sp_fmt(dai->id, bitwidth_sclk, params, cs43130);
+	if (ret)
+		cs43130_hw_free(substream, dai);
+	return ret;
 }
 
 static int cs43130_hw_free(struct snd_pcm_substream *substream,
@@ -990,6 +1003,10 @@ static int cs43130_hw_free(struct snd_pcm_substream *substream,
 	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
 
 	guard(mutex)(&cs43130->clk_mutex);
+	/* hw_free also follows failed refinement and may run repeatedly. */
+	if (!cs43130->dais[dai->id].clock_acquired)
+		return 0;
+	cs43130->dais[dai->id].clock_acquired = false;
 	cs43130->clk_req--;
 	if (!cs43130->clk_req) {
 		/* no DAI is currently using clk */
@@ -1057,32 +1074,57 @@ static int cs43130_pcm_ch_get(struct snd_kcontrol *kcontrol,
 	return snd_soc_get_enum_double(kcontrol, ucontrol);
 }
 
-static int cs43130_pcm_ch_put(struct snd_kcontrol *kcontrol,
-			      struct snd_ctl_elem_value *ucontrol)
+static int cs43130_pcm_ch_select(struct cs43130_private *cs43130,
+				unsigned int val)
 {
-	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
-	unsigned int *item = ucontrol->value.enumerated.item;
-	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
-	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
-	unsigned int val;
-
-	if (item[0] >= e->items)
-		return -EINVAL;
-	val = snd_soc_enum_item_to_val(e, item[0]) << e->shift_l;
+	bool changed;
+	int ret;
 
 	switch (cs43130->dev_id) {
 	case CS43131_CHIP_ID:
 	case CS43198_CHIP_ID:
 		if (val >= 2)
-			regmap_multi_reg_write(cs43130->regmap, pcm_ch_en_seq,
-					       ARRAY_SIZE(pcm_ch_en_seq));
+			ret = regmap_multi_reg_write(cs43130->regmap, pcm_ch_en_seq,
+						    ARRAY_SIZE(pcm_ch_en_seq));
 		else
-			regmap_multi_reg_write(cs43130->regmap, pcm_ch_dis_seq,
-					       ARRAY_SIZE(pcm_ch_dis_seq));
+			ret = regmap_multi_reg_write(cs43130->regmap, pcm_ch_dis_seq,
+						    ARRAY_SIZE(pcm_ch_dis_seq));
+		if (ret)
+			return ret;
 		break;
 	}
+	ret = regmap_update_bits_check(cs43130->regmap, CS43130_PCM_PATH_CTL_2,
+				      3, val, &changed);
+	return ret ? ret : changed;
+}
 
-	return snd_soc_put_enum_double(kcontrol, ucontrol);
+static int cs43130_pcm_ch_put(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
+	unsigned int val = ucontrol->value.enumerated.item[0];
+
+	if (val >= ARRAY_SIZE(pcm_ch_text))
+		return -EINVAL;
+	return cs43130_pcm_ch_select(cs43130, val);
+}
+
+static int cs43130_set_channel_map(struct snd_soc_dai *dai, unsigned int tx_num,
+				 const unsigned int *tx_slot, unsigned int rx_num,
+				 const unsigned int *rx_slot)
+{
+	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(dai->component);
+	unsigned int val;
+	int ret;
+
+	if (dai->id != CS43130_ASP_PCM_DAI || tx_num || rx_num != 2 ||
+	    !rx_slot || rx_slot[0] > 1 || rx_slot[1] > 1)
+		return -EINVAL;
+	/* LR=0, LL=1, RL=2, RR=3: swap before the optional A-to-B copy. */
+	val = (rx_slot[0] << 1) | (rx_slot[0] == rx_slot[1]);
+	ret = cs43130_pcm_ch_select(cs43130, val);
+	return ret < 0 ? ret : 0;
 }
 
 static SOC_ENUM_SINGLE_DECL(pcm_ch_enum, CS43130_PCM_PATH_CTL_2, 0,
@@ -1111,6 +1153,265 @@ static const unsigned int dsd_values[] = {
 static SOC_VALUE_ENUM_SINGLE_DECL(dsd_enum, CS43130_DSD_INT_CFG, 0, 0x03,
 				  dsd_texts, dsd_values);
 
+/*
+ * Headphone operating point for an owner setting (the Q2 has no load
+ * measurement, so the driver otherwise leaves the reset level).
+ *
+ * DS1155F2 7.5.1: OUT_FS (bits 5:4) selects the full scale, 0.5, 1, 1.41 or
+ * 1.73 Vrms; +1dB_EN (bit 0) raises 1.73 to 2 Vrms when HV_EN is set. Both
+ * "must only be updated when PDN_HP is set". 7.5.10: HV_EN (bit 1) sets the
+ * VP_LDO rail to 3.0 V (loads of 600 ohm and above, VP at least 3.3 V) or
+ * 2.6 V (every load, full scale at most 1.41 Vrms); ADPT_PWR (bits 4:2)
+ * selects the class-H rails: 111 adapt to signal, 010 fixed +/-VCP, 001
+ * fixed +/-VP_LDO. Section 4.3: in a fixed mode the output clips when the
+ * signal exceeds what those rails carry.
+ *
+ * Every control here writes only while this codec's HP stage is powered
+ * down (PDN_HP set, checked under the DAPM mutex so a stream cannot power
+ * it up in between) and returns -EBUSY otherwise: change them with the PCM
+ * closed. Only the named bits are updated; HP_IN_EN and the clamps stay
+ * with DAPM.
+ *
+ * HP Full Scale sets OUT_FS, HV_EN only for 1.73 and 2 Vrms, and +1dB_EN
+ * only for 2 Vrms. HP Class H sets ADPT_PWR. Fixed VCP pairs only with
+ * 0.5 Vrms (table 4-2 rates the VCP rails to about 0.49 Vrms at 16 ohm):
+ * either write that would pair it with more returns -EINVAL, so lower the
+ * full scale before fixing the rail and adapt before raising it. HP Output
+ * Level keeps its two pairs: Low is the driver's low-impedance pair
+ * (CLASS_H_CTL 0x1C, HP_OUT_CTL_1 level 0x10), High its reset pair (0x1E,
+ * 0x30); it also restores adapt to signal and clears +1dB_EN.
+ */
+#define CS43130_OUT_FS_MASK	0x30
+#define CS43130_OUT_FS_SHIFT	4
+#define CS43130_PLUS_1DB	0x01
+#define CS43130_ADPT_PWR_MASK	0x1C
+#define CS43130_ADPT_PWR_SHIFT	2
+#define CS43130_HV_EN		0x02
+#define CS43130_FS_0V5		0
+#define CS43130_FS_1V		1
+#define CS43130_FS_1V73		3
+#define CS43130_FS_2V		4
+#define CS43130_ADPT_SIGNAL	7
+#define CS43130_ADPT_VCP	2
+
+static const char * const hp_level_texts[] = { "Low", "High" };
+static SOC_ENUM_SINGLE_EXT_DECL(hp_level_enum, hp_level_texts);
+
+static const char * const hp_full_scale_texts[] = {
+	"0.5 Vrms", "1 Vrms", "1.41 Vrms", "1.73 Vrms", "2 Vrms",
+};
+static SOC_ENUM_SINGLE_EXT_DECL(hp_full_scale_enum, hp_full_scale_texts);
+
+static const char * const hp_class_h_texts[] = {
+	"Adapt to Signal", "Fixed VCP", "Fixed VP_LDO",
+};
+static const unsigned int hp_class_h_values[] = { 7, 2, 1 };
+static SOC_ENUM_SINGLE_EXT_DECL(hp_class_h_enum, hp_class_h_texts);
+
+/* Caller holds the DAPM mutex. */
+static int cs43130_hp_stage_down(struct cs43130_private *cs43130)
+{
+	unsigned int pdn;
+	int ret;
+
+	if (cs43130->pdn_failed)
+		return -EIO;
+	ret = regmap_read(cs43130->regmap, CS43130_PWDN_CTL, &pdn);
+	if (ret)
+		return ret;
+	return (pdn & CS43130_PDN_HP_MASK) ? 0 : -EBUSY;
+}
+
+/* The full scale item (0..4) as HV_EN, OUT_FS and +1dB_EN. */
+static int cs43130_hp_set_full_scale(struct cs43130_private *cs43130,
+				     unsigned int item, bool *changed)
+{
+	unsigned int out_fs = min(item, (unsigned int)CS43130_FS_1V73);
+	unsigned int class_h;
+	bool changed_hv, changed_fs;
+	int ret;
+
+	ret = regmap_read(cs43130->regmap, CS43130_CLASS_H_CTL, &class_h);
+	if (ret)
+		return ret;
+	if (item != CS43130_FS_0V5 &&
+	    (class_h & CS43130_ADPT_PWR_MASK) >> CS43130_ADPT_PWR_SHIFT == CS43130_ADPT_VCP)
+		return -EINVAL;
+	ret = regmap_update_bits_check(cs43130->regmap, CS43130_CLASS_H_CTL,
+				       CS43130_HV_EN,
+				       item >= CS43130_FS_1V73 ? CS43130_HV_EN : 0,
+				       &changed_hv);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits_check(cs43130->regmap, CS43130_HP_OUT_CTL_1,
+				       CS43130_OUT_FS_MASK | CS43130_PLUS_1DB,
+				       (out_fs << CS43130_OUT_FS_SHIFT) |
+				       (item == CS43130_FS_2V ? CS43130_PLUS_1DB : 0),
+				       &changed_fs);
+	if (ret)
+		return ret;
+	*changed |= changed_hv || changed_fs;
+	return 0;
+}
+
+static int cs43130_hp_set_class_h(struct cs43130_private *cs43130,
+				  unsigned int adpt, bool *changed)
+{
+	unsigned int out;
+	bool changed_adpt;
+	int ret;
+
+	ret = regmap_read(cs43130->regmap, CS43130_HP_OUT_CTL_1, &out);
+	if (ret)
+		return ret;
+	if (adpt == CS43130_ADPT_VCP &&
+	    (out & (CS43130_OUT_FS_MASK | CS43130_PLUS_1DB)))
+		return -EINVAL;
+	ret = regmap_update_bits_check(cs43130->regmap, CS43130_CLASS_H_CTL,
+				       CS43130_ADPT_PWR_MASK,
+				       adpt << CS43130_ADPT_PWR_SHIFT, &changed_adpt);
+	if (ret)
+		return ret;
+	*changed |= changed_adpt;
+	return 0;
+}
+
+static int cs43130_hp_full_scale_read(struct cs43130_private *cs43130,
+				      unsigned int *item)
+{
+	unsigned int out, class_h;
+	int ret;
+
+	ret = regmap_read(cs43130->regmap, CS43130_HP_OUT_CTL_1, &out);
+	if (ret)
+		return ret;
+	ret = regmap_read(cs43130->regmap, CS43130_CLASS_H_CTL, &class_h);
+	if (ret)
+		return ret;
+	*item = (out & CS43130_OUT_FS_MASK) >> CS43130_OUT_FS_SHIFT;
+	if (*item == CS43130_FS_1V73 && (out & CS43130_PLUS_1DB) &&
+	    (class_h & CS43130_HV_EN))
+		*item = CS43130_FS_2V;
+	return 0;
+}
+
+/* Applies `set` with the HP stage down; returns 1 if a bit changed. */
+static int cs43130_hp_put_locked(struct snd_kcontrol *kcontrol,
+				 int (*set)(struct cs43130_private *, unsigned int,
+					    bool *),
+				 unsigned int value)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
+	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
+	bool changed = false;
+	int ret;
+
+	snd_soc_dapm_mutex_lock(dapm);
+	ret = cs43130_hp_stage_down(cs43130);
+	if (!ret)
+		ret = set(cs43130, value, &changed);
+	snd_soc_dapm_mutex_unlock(dapm);
+	if (ret)
+		return ret;
+	return changed;
+}
+
+static int cs43130_hp_set_level(struct cs43130_private *cs43130,
+				unsigned int item, bool *changed)
+{
+	int ret;
+
+	ret = cs43130_hp_set_class_h(cs43130, CS43130_ADPT_SIGNAL, changed);
+	if (ret)
+		return ret;
+	return cs43130_hp_set_full_scale(cs43130,
+					 item ? CS43130_FS_1V73 : CS43130_FS_1V,
+					 changed);
+}
+
+static int cs43130_hp_level_get(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
+	unsigned int item;
+	int ret;
+
+	ret = cs43130_hp_full_scale_read(cs43130, &item);
+	if (ret)
+		return ret;
+	ucontrol->value.enumerated.item[0] = item > CS43130_FS_1V ? 1 : 0;
+	return 0;
+}
+
+static int cs43130_hp_level_put(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	unsigned int item = ucontrol->value.enumerated.item[0];
+
+	if (item > 1)
+		return -EINVAL;
+	return cs43130_hp_put_locked(kcontrol, cs43130_hp_set_level, item);
+}
+
+static int cs43130_hp_full_scale_get(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
+	unsigned int item;
+	int ret;
+
+	ret = cs43130_hp_full_scale_read(cs43130, &item);
+	if (ret)
+		return ret;
+	ucontrol->value.enumerated.item[0] = item;
+	return 0;
+}
+
+static int cs43130_hp_full_scale_put(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	unsigned int item = ucontrol->value.enumerated.item[0];
+
+	if (item >= ARRAY_SIZE(hp_full_scale_texts))
+		return -EINVAL;
+	return cs43130_hp_put_locked(kcontrol, cs43130_hp_set_full_scale, item);
+}
+
+static int cs43130_hp_class_h_get(struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
+	unsigned int reg, adpt, i;
+	int ret;
+
+	ret = regmap_read(cs43130->regmap, CS43130_CLASS_H_CTL, &reg);
+	if (ret)
+		return ret;
+	adpt = (reg & CS43130_ADPT_PWR_MASK) >> CS43130_ADPT_PWR_SHIFT;
+	for (i = 0; i < ARRAY_SIZE(hp_class_h_values); i++)
+		if (hp_class_h_values[i] == adpt)
+			break;
+	if (i == ARRAY_SIZE(hp_class_h_values))
+		return -EINVAL;
+	ucontrol->value.enumerated.item[0] = i;
+	return 0;
+}
+
+static int cs43130_hp_class_h_put(struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *ucontrol)
+{
+	unsigned int item = ucontrol->value.enumerated.item[0];
+
+	if (item >= ARRAY_SIZE(hp_class_h_values))
+		return -EINVAL;
+	return cs43130_hp_put_locked(kcontrol, cs43130_hp_set_class_h,
+				     hp_class_h_values[item]);
+}
+
 static const struct snd_kcontrol_new cs43130_snd_controls[] = {
 	SOC_DOUBLE_R_TLV("Master Playback Volume",
 			 CS43130_PCM_VOL_A, CS43130_PCM_VOL_B, 0, 0xFF, 1,
@@ -1126,6 +1427,12 @@ static const struct snd_kcontrol_new cs43130_snd_controls[] = {
 	SOC_SINGLE("PCM High-pass Filter", CS43130_PCM_FILT_OPT, 1, 1, 0),
 	SOC_SINGLE("PCM De-emphasis Filter", CS43130_PCM_FILT_OPT, 0, 1, 0),
 	SOC_ENUM("DSD Phase Modulation", dsd_enum),
+	SOC_ENUM_EXT("HP Output Level", hp_level_enum, cs43130_hp_level_get,
+		     cs43130_hp_level_put),
+	SOC_ENUM_EXT("HP Full Scale", hp_full_scale_enum,
+		     cs43130_hp_full_scale_get, cs43130_hp_full_scale_put),
+	SOC_ENUM_EXT("HP Class H", hp_class_h_enum, cs43130_hp_class_h_get,
+		     cs43130_hp_class_h_put),
 };
 
 static const struct reg_sequence pcm_seq[] = {
@@ -1306,14 +1613,131 @@ static const struct reg_sequence dac_postpmd_seq[] = {
 	{CS43130_DXD1, 0},
 };
 
+/* Exercise the complete DS1155F2 Example 5-3 interrupt-mask sequence.
+ * Standard interrupt semantics predict masked status should still latch;
+ * retain readbacks so a device-specific difference can be tested explicitly.
+ */
+static int cs43130_pdn_mask(struct cs43130_private *cs43130, bool restore)
+{
+	unsigned int value = 0;
+	int saved_ret = 0, ret;
+
+	if (!restore) {
+		cs43130->pdn_mask_held = false;
+		cs43130->pdn_original_mask = 0;
+		saved_ret = regmap_read_bypassed(cs43130->regmap,
+			CS43130_INT_MASK_1, &cs43130->pdn_original_mask);
+		if (saved_ret) {
+			ret = saved_ret;
+			goto report;
+		}
+		/* Restore even if the following write reports a partial failure. */
+		cs43130->pdn_mask_held = true;
+	} else if (!cs43130->pdn_mask_held) {
+		return 0;
+	}
+	ret = regmap_update_bits(cs43130->regmap, CS43130_INT_MASK_1,
+		BIT(0), restore ? cs43130->pdn_original_mask & BIT(0) : 0);
+	if (!ret)
+		ret = regmap_read_bypassed(cs43130->regmap, CS43130_INT_MASK_1, &value);
+	if (!ret && (value & BIT(0)) !=
+		(restore ? cs43130->pdn_original_mask & BIT(0) : 0))
+		ret = -EIO;
+report:
+	dev_info(cs43130->dev,
+		"HP power-down mask: addr=%02x phase=%u saved=%02x/%d value=%02x/%d\n",
+		to_i2c_client(cs43130->dev)->addr, restore ? 1 : 0,
+		cs43130->pdn_original_mask, saved_ret, value, ret);
+	if (restore)
+		cs43130->pdn_mask_held = false;
+	return ret;
+}
+
+/* DAPM orders every DAC's subsequence0 before this subsequence-1
+ * barrier during power-down. Request all HP shutdowns first, then wait
+ * while all ASP widgets and their clocks remain powered. No worker or
+ * changed timeout is needed; an isolated DAC shutdown follows the same path.
+ */
+static int cs43130_hp_shutdown_event(struct snd_soc_dapm_widget *w,
+				   struct snd_kcontrol *kcontrol, int event)
+{
+	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
+	unsigned int status = 0, state = 0;
+	int ret, state_ret;
+
+		/* Experimental timing discriminator: preserve the original 100ms
+		 * boundary, then observe at most another 400ms without returning
+		 * to DAPM (which otherwise continues powering ASP down on error).
+		 * Completion exits immediately; there is no minimum silent pad.
+		 * This is an observation bound, not a specified silicon maximum.
+		 */
+		if (cs43130->dev_id == CS43131_CHIP_ID && !cs43130->has_irq_line) {
+			s64 started = ktime_to_us(ktime_get()), observed;
+			unsigned int pdn = 0, clock = 0;
+			int initial, pdn_ret, clock_ret, mask_ret;
+			unsigned int address = to_i2c_client(cs43130->dev)->addr;
+
+			/* DAPM logs PRE_PMD errors but still invokes POST_PMD. */
+			if (cs43130->pdn_failed)
+				return -EIO;
+			state_ret = regmap_read_bypassed(cs43130->regmap,
+				CS43130_PWDN_CTL, &state);
+			dev_info(cs43130->dev,
+				"HP power-down state: addr=%02x phase=%u pdn=%02x/%d status=%02x/%d\n",
+				to_i2c_client(cs43130->dev)->addr, 2U, state, state_ret, 0, -ENODATA);
+			ret = regmap_read_poll_timeout(cs43130->regmap,
+				CS43130_INT_STATUS_1, status, status & BIT(0), 1000, 100000);
+			initial = ret;
+			if (ret == -ETIMEDOUT) {
+				observed = ktime_to_us(ktime_get());
+				dev_info(cs43130->dev,
+					"HP power-down boundary: addr=%02x request_us=%lld poll_us=%lld status=%02x\n",
+					address, observed - cs43130->pdn_request_us,
+					observed - started, status);
+				ret = regmap_read_poll_timeout(cs43130->regmap,
+					CS43130_INT_STATUS_1, status, status & BIT(0), 1000, 400000);
+			}
+			observed = ktime_to_us(ktime_get());
+			/* These registers are cached normally. Observe the actual bus;
+			 * successful cached reads do not establish physical clock state.
+			 */
+			pdn_ret = regmap_read_bypassed(cs43130->regmap,
+				CS43130_PWDN_CTL, &pdn);
+			clock_ret = regmap_read_bypassed(cs43130->regmap,
+				CS43130_SYS_CLK_CTL_1, &clock);
+			dev_info(cs43130->dev,
+				"HP power-down observation: addr=%02x initial=%d final=%d request_us=%lld poll_us=%lld status=%02x pdn=%02x/%d clock=%02x/%d\n",
+				address, initial, ret, observed - cs43130->pdn_request_us,
+				observed - started, status, pdn, pdn_ret, clock, clock_ret);
+			mask_ret = cs43130_pdn_mask(cs43130, true);
+			if (ret) {
+				cs43130->pdn_failed = true;
+				dev_err(cs43130->dev,
+					"HP power-down completion failed: %d status=%02x pdn=%02x/%d clock=%02x/%d\n",
+					ret, status, pdn, pdn_ret, clock, clock_ret);
+				return ret;
+			}
+			if (mask_ret) {
+				cs43130->pdn_failed = true;
+				return mask_ret;
+			}
+		}
+	return 0;
+}
+
 static int cs43130_dac_event(struct snd_soc_dapm_widget *w,
 			     struct snd_kcontrol *kcontrol, int event)
 {
 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
 	struct cs43130_private *cs43130 = snd_soc_component_get_drvdata(component);
+	unsigned int status = 0, state = 0;
+	int ret, state_ret;
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
+		if (cs43130->pdn_failed)
+			return -EIO;
 		switch (cs43130->dev_id) {
 		case CS43130_CHIP_ID:
 		case CS4399_CHIP_ID:
@@ -1353,8 +1777,44 @@ static int cs43130_dac_event(struct snd_soc_dapm_widget *w,
 		}
 
 		regmap_write(cs43130->regmap, CS43130_DXD1, 0);
+		/* Observe physical HP state without consuming interrupt status. */
+		if (cs43130->dev_id == CS43131_CHIP_ID && !cs43130->has_irq_line) {
+			state_ret = regmap_read_bypassed(cs43130->regmap,
+				CS43130_PWDN_CTL, &state);
+			dev_info(cs43130->dev,
+				"HP power-down state: addr=%02x phase=%u pdn=%02x/%d status=%02x/%d\n",
+				to_i2c_client(cs43130->dev)->addr, 0U, state, state_ret, 0, -ENODATA);
+		}
+		break;
+	case SND_SOC_DAPM_PRE_PMD:
+		/* Q2 has no codec IRQ line. Drain the prior read-to-clear event
+		 * while HP is still on, before DAPM asserts PDN_HP. IRQ-backed
+		 * platforms need coordinated interrupt ownership instead.
+		 */
+		if (cs43130->dev_id == CS43131_CHIP_ID && !cs43130->has_irq_line) {
+			if (cs43130->pdn_failed)
+				return -EIO;
+			ret = cs43130_pdn_mask(cs43130, false);
+			if (!ret) {
+				state_ret = regmap_read_bypassed(cs43130->regmap,
+					CS43130_PWDN_CTL, &state);
+				ret = regmap_read(cs43130->regmap, CS43130_INT_STATUS_1, &status);
+				dev_info(cs43130->dev,
+					"HP power-down state: addr=%02x phase=%u pdn=%02x/%d status=%02x/%d\n",
+					to_i2c_client(cs43130->dev)->addr, 1U, state, state_ret, status, ret);
+			}
+			if (ret) {
+				cs43130_pdn_mask(cs43130, true);
+				cs43130->pdn_failed = true;
+				return ret;
+			}
+			cs43130->pdn_request_us = ktime_to_us(ktime_get());
+		}
 		break;
 	case SND_SOC_DAPM_POST_PMD:
+		/* Q2 completion is checked by HP Shutdown Barrier after all
+		 * active DACs have requested power-down, before ASP teardown.
+		 */
 		switch (cs43130->dev_id) {
 		case CS43130_CHIP_ID:
 		case CS4399_CHIP_ID:
@@ -1446,7 +1906,14 @@ static const struct snd_soc_dapm_widget hp_widgets[] = {
 	SND_SOC_DAPM_DAC_E("HiFi DAC", NULL, CS43130_PWDN_CTL,
 			   CS43130_PDN_HP_SHIFT, 1, cs43130_dac_event,
 			   (SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
-			    SND_SOC_DAPM_POST_PMD)),
+			    SND_SOC_DAPM_PRE_PMD | SND_SOC_DAPM_POST_PMD)),
+
+	{
+		.id = snd_soc_dapm_dac, .name = "HP Shutdown Barrier",
+		SND_SOC_DAPM_INIT_REG_VAL(SND_SOC_NOPM, 0, 0),
+		.subseq = -1, .event = cs43130_hp_shutdown_event,
+		.event_flags = SND_SOC_DAPM_POST_PMD,
+	},
 
 /* Some devices have some extra analog widgets */
 #define NUM_ANALOG_WIDGETS	1
@@ -1464,8 +1931,9 @@ static const struct snd_soc_dapm_route hp_routes[] = {
 	{"DSD", NULL, "ASPIN DoP"},
 	{"DSD", NULL, "XSPIN DoP"},
 	{"DSD", NULL, "XSPIN DSD"},
-	{"HiFi DAC", NULL, "ASPIN PCM"},
-	{"HiFi DAC", NULL, "DSD"},
+	{"HP Shutdown Barrier", NULL, "ASPIN PCM"},
+	{"HP Shutdown Barrier", NULL, "DSD"},
+	{"HiFi DAC", NULL, "HP Shutdown Barrier"},
 	{"Bypass Switch", "Internal", "HiFi DAC"},
 	{"HPOUTA", NULL, "Bypass Switch"},
 	{"HPOUTB", NULL, "Bypass Switch"},
@@ -1615,6 +2083,7 @@ static const struct snd_soc_dai_ops cs43130_pcm_ops = {
 	.hw_free	= cs43130_hw_free,
 	.set_sysclk	= cs43130_set_sysclk,
 	.set_fmt	= cs43130_pcm_set_fmt,
+	.set_channel_map = cs43130_set_channel_map,
 };
 
 static const struct snd_soc_dai_ops cs43130_dop_ops = {
@@ -2491,6 +2960,41 @@ static int cs43130_handle_device_data(struct cs43130_private *cs43130)
 	return 0;
 }
 
+/* Legacy reset-gpios uses logical 1 to release reset. Preserve that ABI;
+ * shared-reset opts into reset-controller polarity and reference counting.
+ */
+static int cs43130_reset_release(struct cs43130_private *cs43130)
+{
+	int ret;
+
+	if (cs43130->reset_released)
+		return 0;
+	if (cs43130->shared_reset) {
+		usleep_range(1000, 1100);
+		ret = reset_control_deassert(cs43130->shared_reset);
+	} else {
+		ret = gpiod_set_value_cansleep(cs43130->reset_gpio, 1);
+	}
+	if (!ret)
+		cs43130->reset_released = true;
+	return ret;
+}
+
+static int cs43130_reset_assert(struct cs43130_private *cs43130)
+{
+	int ret;
+
+	if (!cs43130->reset_released)
+		return 0;
+	if (cs43130->shared_reset)
+		ret = reset_control_assert(cs43130->shared_reset);
+	else
+		ret = gpiod_set_value_cansleep(cs43130->reset_gpio, 0);
+	if (!ret)
+		cs43130->reset_released = false;
+	return ret;
+}
+
 static int cs43130_i2c_probe(struct i2c_client *client)
 {
 	const struct snd_soc_component_driver *component_driver;
@@ -2529,6 +3033,17 @@ static int cs43130_i2c_probe(struct i2c_client *client)
 		dev_err(cs43130->dev, "Failed to request supplies: %d\n", ret);
 		return ret;
 	}
+	/* Acquire the shared reset while the supplies are still off. The GPIO
+	 * reset provider initially asserts the line; later users share it without
+	 * resetting codecs that have already completed probe.
+	 */
+	if (device_property_read_bool(cs43130->dev, "cirrus,shared-reset")) {
+		cs43130->shared_reset = devm_reset_control_get_shared(cs43130->dev, NULL);
+		if (IS_ERR(cs43130->shared_reset))
+			return dev_err_probe(cs43130->dev,
+				PTR_ERR(cs43130->shared_reset), "Failed to get shared reset\n");
+	}
+
 	ret = regulator_bulk_enable(ARRAY_SIZE(cs43130->supplies),
 				    cs43130->supplies);
 	if (ret != 0) {
@@ -2536,14 +3051,17 @@ static int cs43130_i2c_probe(struct i2c_client *client)
 		return ret;
 	}
 
-	cs43130->reset_gpio = devm_gpiod_get_optional(cs43130->dev,
-						      "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(cs43130->reset_gpio)) {
-		ret = PTR_ERR(cs43130->reset_gpio);
-		goto err_supplies;
+	if (!cs43130->shared_reset) {
+		cs43130->reset_gpio = devm_gpiod_get_optional(cs43130->dev,
+							   "reset", GPIOD_OUT_LOW);
+		if (IS_ERR(cs43130->reset_gpio)) {
+			ret = PTR_ERR(cs43130->reset_gpio);
+			goto err_supplies;
+		}
 	}
-
-	gpiod_set_value_cansleep(cs43130->reset_gpio, 1);
+	ret = cs43130_reset_release(cs43130);
+	if (ret)
+		goto err_supplies;
 
 	usleep_range(2000, 2050);
 
@@ -2635,7 +3153,7 @@ static int cs43130_i2c_probe(struct i2c_client *client)
 	return 0;
 
 err:
-	gpiod_set_value_cansleep(cs43130->reset_gpio, 0);
+	cs43130_reset_assert(cs43130);
 err_supplies:
 	regulator_bulk_disable(ARRAY_SIZE(cs43130->supplies),
 			       cs43130->supplies);
@@ -2666,7 +3184,7 @@ static void cs43130_i2c_remove(struct i2c_client *client)
 		device_remove_file(cs43130->dev, &dev_attr_hpload_ac_r);
 	}
 
-	gpiod_set_value_cansleep(cs43130->reset_gpio, 0);
+	cs43130_reset_assert(cs43130);
 
 	pm_runtime_disable(cs43130->dev);
 	regulator_bulk_disable(CS43130_NUM_SUPPLIES, cs43130->supplies);
@@ -2684,7 +3202,7 @@ static int cs43130_runtime_suspend(struct device *dev)
 	regcache_cache_only(cs43130->regmap, true);
 	regcache_mark_dirty(cs43130->regmap);
 
-	gpiod_set_value_cansleep(cs43130->reset_gpio, 0);
+	cs43130_reset_assert(cs43130);
 
 	regulator_bulk_disable(CS43130_NUM_SUPPLIES, cs43130->supplies);
 
@@ -2704,7 +3222,9 @@ static int cs43130_runtime_resume(struct device *dev)
 
 	regcache_cache_only(cs43130->regmap, false);
 
-	gpiod_set_value_cansleep(cs43130->reset_gpio, 1);
+	ret = cs43130_reset_release(cs43130);
+	if (ret)
+		goto err;
 
 	usleep_range(2000, 2050);
 
@@ -2720,6 +3240,7 @@ static int cs43130_runtime_resume(struct device *dev)
 
 	return 0;
 err:
+	cs43130_reset_assert(cs43130);
 	regcache_cache_only(cs43130->regmap, true);
 	regulator_bulk_disable(CS43130_NUM_SUPPLIES, cs43130->supplies);
 
@@ -2727,6 +3248,7 @@ err:
 }
 
 static const struct dev_pm_ops cs43130_runtime_pm = {
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(cs43130_runtime_suspend, cs43130_runtime_resume, NULL)
 };
 

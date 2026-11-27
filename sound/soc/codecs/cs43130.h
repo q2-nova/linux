@@ -494,6 +494,7 @@ static const char *const cs43130_supply_names[CS43130_NUM_SUPPLIES] = {
 #define CS43130_NUM_INT		5       /* number of interrupt status reg */
 
 struct cs43130_dai {
+	bool				clock_acquired;
 	unsigned int			sclk;
 	unsigned int			dai_format;
 	unsigned int			dai_mode;
@@ -506,6 +507,12 @@ struct	cs43130_private {
 	struct regmap			*regmap;
 	struct regulator_bulk_data	supplies[CS43130_NUM_SUPPLIES];
 	struct gpio_desc		*reset_gpio;
+	struct reset_control	*shared_reset;
+	bool reset_released;
+	bool pdn_failed;
+	s64 pdn_request_us;
+	unsigned int pdn_original_mask;
+	bool pdn_mask_held;
 	unsigned int			dev_id; /* codec device ID */
 	int				xtal_ibias;
 	bool				has_irq_line;

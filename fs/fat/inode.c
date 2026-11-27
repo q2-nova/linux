@@ -253,7 +253,7 @@ static int fat_write_end(const struct kiocb *iocb,
 	return err;
 }
 
-static ssize_t fat_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+static ssize_t __maybe_unused fat_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct file *file = iocb->ki_filp;
 	struct address_space *mapping = file->f_mapping;
@@ -281,7 +281,8 @@ static ssize_t fat_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	 * FAT need to use the DIO_LOCKING for avoiding the race
 	 * condition of fat_get_block() and ->truncate().
 	 */
-	ret = blockdev_direct_IO(iocb, inode, iter, fat_get_block);
+	/* q2: the installed kernel has no legacy direct I/O; not offered. */
+	ret = -EINVAL;
 	if (ret < 0 && iov_iter_rw(iter) == WRITE)
 		fat_write_failed(mapping, offset + count);
 
@@ -345,7 +346,6 @@ static const struct address_space_operations fat_aops = {
 	.writepages	= fat_writepages,
 	.write_begin	= fat_write_begin,
 	.write_end	= fat_write_end,
-	.direct_IO	= fat_direct_IO,
 	.bmap		= _fat_bmap,
 	.migrate_folio	= buffer_migrate_folio,
 };

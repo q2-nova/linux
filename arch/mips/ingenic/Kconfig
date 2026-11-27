@@ -9,6 +9,7 @@ config MACH_INGENIC_GENERIC
 	select MACH_JZ4780
 	select MACH_X1000
 	select MACH_X1830
+	select MACH_X2000
 
 choice
 	prompt "Machine type"
@@ -43,6 +44,10 @@ config X1830_CU1830_NEO
 	bool "YSH & ATIL CU1830 Module with Neo backplane"
 	select MACH_X1830
 
+config X2000_SHANLING_Q2
+	bool "Shanling Q2 portable music player"
+	select MACH_X2000
+
 endchoice
 
 config MACH_JZ4725B
@@ -76,3 +81,28 @@ config MACH_X1830
 	select MIPS_CPU_SCACHE
 	select SYS_HAS_CPU_MIPS32_R2
 	select SYS_SUPPORTS_HIGHMEM
+
+config MACH_X2000
+	bool
+	select GENERIC_CLOCKEVENTS_BROADCAST if SMP
+	select SYS_HAS_CPU_MIPS32_R5
+	select SYS_SUPPORTS_HIGHMEM
+	select SYS_SUPPORTS_SMP
+	select MIPS_O32_FP64_SUPPORT
+	select WEAK_ORDERING
+	select WEAK_REORDERING_BEYOND_LLSC
+
+config INGENIC_X2000_SMP
+	def_bool SMP && MACH_X2000 && !MIPS_CPS
+	select SYS_SUPPORTS_HOTPLUG_CPU
+	select GENERIC_IRQ_MIGRATION if HOTPLUG_CPU
+
+config INGENIC_X2000_NORMAL_SLEEP
+	bool "Q2 normal retained-CPU system sleep"
+	depends on X2000_SHANLING_Q2 && SUSPEND && INGENIC_X2000_WDT=y
+	help
+	  Admit ordinary Linux mem suspend on the Q2 using the retained-CPU
+	  SLEEP sequence. The ordinary watchdog device PM policy stops its
+	  timer for indefinite sleep and restores the previous state on resume.
+	  Only the public proof and entry policy are exposed. Leave disabled
+	  for the journal/generation-bound diagnostic recovery profile.

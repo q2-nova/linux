@@ -13,6 +13,18 @@
 
 #include "inftrees.h"
 
+/*
+ * Run-time selectable inflate_fast() and Adler-32 variants (inffast.c,
+ * inflate.c). Not in the pre-boot decompressor, which includes these files
+ * with STATIC defined.
+ */
+#ifndef STATIC
+#define ZLIB_INFLATE_VARIANTS 1
+#if defined(CONFIG_CPU_HAS_MSA) && defined(TOOLCHAIN_SUPPORTS_MSA)
+#define ZLIB_INFLATE_MSA 1
+#endif
+#endif
+
 /* Possible inflate modes between inflate() calls */
 typedef enum {
     HEAD,       /* i: waiting for magic header */
@@ -109,6 +121,11 @@ struct inflate_state {
     unsigned short lens[320];   /* temporary storage for code lengths */
     unsigned short work[288];   /* work area for code table building */
     code codes[ENOUGH];         /* space for code tables */
+#ifdef ZLIB_INFLATE_VARIANTS
+        /* chosen by zlib_inflate() for the current call */
+    unsigned fast;              /* inflate_fast() variant */
+    unsigned simd;              /* MSA usable (kernel_msa_begin() held) */
+#endif
 };
 
 /* Reverse the bytes in a 32-bit value */

@@ -19,6 +19,7 @@
 #include <linux/spinlock.h>
 #include <linux/export.h>
 #include <linux/cpufreq.h>
+#include <linux/clk.h>
 #include <linux/delay.h>
 
 #include <asm/cpu-features.h>
@@ -38,46 +39,52 @@ static int cpufreq_callback(struct notifier_block *nb,
 {
 	struct cpufreq_freqs *freq = data;
 	struct cpumask *cpus = freq->policy->cpus;
-	unsigned long lpj;
+	unsigned long rate, actual, lpj;
 	int cpu;
 
-	/*
-	 * Skip lpj numbers adjustment if the CPU-freq transition is safe for
-	 * the loops delay. (Is this possible?)
-	 */
 	if (freq->flags & CPUFREQ_CONST_LOOPS)
 		return NOTIFY_OK;
 
-	/* Save the initial values of the lpjes for future scaling. */
 	if (!glb_lpj_ref) {
-		glb_lpj_ref = boot_cpu_data.udelay_val;
+		glb_lpj_ref = cpu_data[freq->policy->cpu].udelay_val;
 		glb_lpj_ref_freq = freq->old;
+	}
 
-		for_each_online_cpu(cpu) {
-			per_cpu(pcp_lpj_ref, cpu) =
-				cpu_data[cpu].udelay_val;
+	/* A CPU may first participate after earlier transitions while offline. */
+	for_each_cpu(cpu, cpus) {
+		if (!per_cpu(pcp_lpj_ref_freq, cpu)) {
+			per_cpu(pcp_lpj_ref, cpu) = cpu_data[cpu].udelay_val;
 			per_cpu(pcp_lpj_ref_freq, cpu) = freq->old;
 		}
 	}
 
-	/*
-	 * Adjust global lpj variable and per-CPU udelay_val number in
-	 * accordance with the new CPU frequency.
-	 */
-	if ((val == CPUFREQ_PRECHANGE  && freq->old < freq->new) ||
-	    (val == CPUFREQ_POSTCHANGE && freq->old > freq->new)) {
-		loops_per_jiffy = cpufreq_scale(glb_lpj_ref,
-						glb_lpj_ref_freq,
-						freq->new);
-
-		for_each_cpu(cpu, cpus) {
-			lpj = cpufreq_scale(per_cpu(pcp_lpj_ref, cpu),
-					    per_cpu(pcp_lpj_ref_freq, cpu),
-					    freq->new);
-			cpu_data[cpu].udelay_val = (unsigned int)lpj;
+	/* Never shorten delays before an increase or an uncompleted decrease. */
+	if (val == CPUFREQ_PRECHANGE) {
+		rate = max(freq->old, freq->new);
+	} else if (val == CPUFREQ_POSTCHANGE) {
+		rate = freq->new;
+		if (freq->policy->clk) {
+			/*
+			 * Failed transitions also emit the requested POST before the
+			 * rollback notifications. Use the achieved hardware rate so
+			 * a failed decrease cannot briefly under-calibrate delays.
+			 */
+			actual = clk_get_rate(freq->policy->clk) / 1000;
+			if (WARN_ON_ONCE(!actual))
+				rate = max(freq->old, freq->new);
+			else
+				rate = actual;
 		}
+	} else {
+		return NOTIFY_OK;
 	}
 
+	loops_per_jiffy = cpufreq_scale(glb_lpj_ref, glb_lpj_ref_freq, rate);
+	for_each_cpu(cpu, cpus) {
+		lpj = cpufreq_scale(per_cpu(pcp_lpj_ref, cpu),
+				    per_cpu(pcp_lpj_ref_freq, cpu), rate);
+		cpu_data[cpu].udelay_val = (unsigned int)lpj;
+	}
 	return NOTIFY_OK;
 }
 

@@ -29,6 +29,7 @@ select:
           - ingenic,jz4780-cgu
           - ingenic,x1000-cgu
           - ingenic,x1830-cgu
+          - ingenic,x2000-cgu
   required:
     - compatible
 
@@ -45,6 +46,12 @@ properties:
   "#clock-cells":
     const: 1
 
+  "#power-domain-cells":
+    const: 1
+    description: |
+      X2000 accelerator domain ID from dt-bindings/power/ingenic,x2000-power.h.
+      CPU, DDR and peripheral SRAM are not exposed as these domains.
+
   ranges: true
 
   compatible:
@@ -59,6 +66,7 @@ properties:
           - ingenic,jz4780-cgu
           - ingenic,x1000-cgu
           - ingenic,x1830-cgu
+          - ingenic,x2000-cgu
       - const: simple-mfd
     minItems: 1
 
@@ -101,6 +109,17 @@ patternProperties:
     $ref: /schemas/phy/ingenic,phy-usb.yaml#
   "^mac-phy-ctrl@[a-f0-9]+$":
     $ref: /schemas/net/ingenic,mac.yaml#
+
+allOf:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: ingenic,x2000-cgu
+    then:
+      properties:
+        "#power-domain-cells": false
 
 additionalProperties: false
 

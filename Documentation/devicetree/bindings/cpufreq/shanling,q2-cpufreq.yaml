@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/cpufreq/shanling,q2-cpufreq.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Shanling Q2 shared CPU and L2 divider scaling
+
+maintainers:
+  - Nova <361320585+q2-nova@users.noreply.github.com>
+
+description: |
+  The X2000 logical CPUs share a CPU clock and coupled L2 divider. The Q2
+  operates these from a fixed 1200 MHz parent and fixed core supply. This
+  provider supports divider changes only, without changing PLLs or supplies.
+
+properties:
+  compatible:
+    const: shanling,q2-cpufreq
+  clocks:
+    maxItems: 3
+  clock-names:
+    items:
+      - const: cpu
+      - const: l2
+      - const: parent
+
+required:
+  - compatible
+  - clocks
+  - clock-names
+
+additionalProperties: false

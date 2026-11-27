@@ -75,19 +75,28 @@ void local_flush_tlb_all(void)
 	 * If there are any wired entries, fall back to iterating
 	 */
 	if (cpu_has_tlbinv && !entry) {
-		if (current_cpu_data.tlbsizevtlb) {
-			write_c0_index(0);
+		/* XBurst2 Core PM: TLBINVF covers the entire VTLB/FTLB.
+		 * Match the vendor path; Index does not select an FTLB set.
+		 */
+		if (current_cpu_type() == CPU_XBURST &&
+		    (read_c0_prid() & PRID_IMP_MASK) == PRID_IMP_XBURST2) {
 			mtc0_tlbw_hazard();
-			tlbinvf();  /* invalidate VTLB */
-		}
-		ftlbhighset = current_cpu_data.tlbsizevtlb +
-			current_cpu_data.tlbsizeftlbsets;
-		for (entry = current_cpu_data.tlbsizevtlb;
-		     entry < ftlbhighset;
-		     entry++) {
-			write_c0_index(entry);
-			mtc0_tlbw_hazard();
-			tlbinvf();  /* invalidate one FTLB set */
+			tlbinvf();
+		} else {
+			if (current_cpu_data.tlbsizevtlb) {
+				write_c0_index(0);
+				mtc0_tlbw_hazard();
+				tlbinvf();  /* invalidate VTLB */
+			}
+			ftlbhighset = current_cpu_data.tlbsizevtlb +
+				current_cpu_data.tlbsizeftlbsets;
+			for (entry = current_cpu_data.tlbsizevtlb;
+			     entry < ftlbhighset;
+			     entry++) {
+				write_c0_index(entry);
+				mtc0_tlbw_hazard();
+				tlbinvf();  /* invalidate one FTLB set */
+			}
 		}
 	} else {
 		while (entry < current_cpu_data.tlbsize) {

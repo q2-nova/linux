@@ -151,6 +151,13 @@ struct rtc_device {
 	time64_t offset_secs;
 	bool set_start_time;
 
+	/* Non-consuming user-alarm attribution, protected by ops_lock. */
+	u64 alarm_changes;
+	u64 alarm_events;
+	u64 alarm_last_boottime_ns;
+	bool alarm_events_overflow;
+	unsigned int alarm_wake_irq;
+
 #ifdef CONFIG_RTC_INTF_DEV_UIE_EMUL
 	struct work_struct uie_task;
 	struct timer_list uie_timer;

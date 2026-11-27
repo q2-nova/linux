@@ -12,12 +12,14 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 
 #include <linux/pinctrl/consumer.h>
 #include <linux/pinctrl/pinconf-generic.h>
@@ -133,6 +135,8 @@ struct ingenic_chip_info {
 };
 
 struct ingenic_pinctrl {
+	/* Port Z is shared by all banks and IRQ/direction/mux operations. */
+	raw_spinlock_t shadow_lock;
 	struct device *dev;
 	struct regmap *map;
 	struct pinctrl_dev *pctl;
@@ -2995,6 +2999,8 @@ static int x2000_mac1_rgmii_pins[] = {
 	0x33, 0x34, 0x36, 0x35, 0x37,
 };
 static int x2000_otg_pins[] = { 0x96, };
+/* PE23: RTC 32 kHz clock output (the RTL8733BS sleep clock on the Q2). */
+static int x2000_clk32k_pins[] = { 0x97, };
 
 static u8 x2000_cim_8bit_funcs[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, };
 
@@ -3133,6 +3139,7 @@ static const struct group_desc x2000_groups[] = {
 	INGENIC_PIN_GROUP("mac1-rmii", x2000_mac1_rmii, 3),
 	INGENIC_PIN_GROUP("mac1-rgmii", x2000_mac1_rgmii, 3),
 	INGENIC_PIN_GROUP("otg-vbus", x2000_otg, 0),
+	INGENIC_PIN_GROUP("clk32k", x2000_clk32k, 0),
 };
 
 static const char *x2000_uart0_groups[] = { "uart0-data", "uart0-hwflow", };
@@ -3220,6 +3227,7 @@ static const char *x2000_pwm15_groups[] = { "pwm15", };
 static const char *x2000_mac0_groups[] = { "mac0-rmii", "mac0-rgmii", };
 static const char *x2000_mac1_groups[] = { "mac1-rmii", "mac1-rgmii", };
 static const char *x2000_otg_groups[] = { "otg-vbus", };
+static const char *x2000_clk32k_groups[] = { "clk32k", };
 
 static const struct pinfunction x2000_functions[] = {
 	INGENIC_PIN_FUNCTION("uart0", x2000_uart0),
@@ -3272,6 +3280,7 @@ static const struct pinfunction x2000_functions[] = {
 	INGENIC_PIN_FUNCTION("mac0", x2000_mac0),
 	INGENIC_PIN_FUNCTION("mac1", x2000_mac1),
 	INGENIC_PIN_FUNCTION("otg", x2000_otg),
+	INGENIC_PIN_FUNCTION("clk32k", x2000_clk32k),
 };
 
 static const struct regmap_range x2000_access_ranges[] = {
@@ -3592,10 +3601,13 @@ static void irq_set_type(struct ingenic_gpio_chip *jzgc,
 {
 	u8 reg1, reg2;
 	bool val1, val2, val3;
+	unsigned long flags;
 
 	switch (type) {
 	case IRQ_TYPE_EDGE_BOTH:
-		val1 = val2 = false;
+		/* EDG enables both edges; PAT1 must still select edge mode. */
+		val1 = false;
+		val2 = true;
 		val3 = true;
 		break;
 	case IRQ_TYPE_EDGE_RISING:
@@ -3629,15 +3641,19 @@ static void irq_set_type(struct ingenic_gpio_chip *jzgc,
 		return;
 	}
 
-	if (is_soc_or_above(jzgc->jzpc, ID_X2000)) {
-		ingenic_gpio_shadow_set_bit(jzgc, reg2, offset, val1);
-		ingenic_gpio_shadow_set_bit(jzgc, reg1, offset, val2);
-		ingenic_gpio_shadow_set_bit_load(jzgc);
-		ingenic_gpio_set_bit(jzgc, X2000_GPIO_EDG, offset, val3);
-	} else if (is_soc_or_above(jzgc->jzpc, ID_X1000)) {
-		ingenic_gpio_shadow_set_bit(jzgc, reg2, offset, val1);
-		ingenic_gpio_shadow_set_bit(jzgc, reg1, offset, val2);
-		ingenic_gpio_shadow_set_bit_load(jzgc);
+	if (is_soc_or_above(jzgc->jzpc, ID_X1000)) {
+		raw_spin_lock_irqsave(&jzgc->jzpc->shadow_lock, flags);
+		if (jzgc->jzpc->info->version == ID_X2000) {
+			ingenic_gpio_set_bit(jzgc, reg2, offset, val1);
+			ingenic_gpio_set_bit(jzgc, reg1, offset, val2);
+		} else {
+			ingenic_gpio_shadow_set_bit(jzgc, reg2, offset, val1);
+			ingenic_gpio_shadow_set_bit(jzgc, reg1, offset, val2);
+			ingenic_gpio_shadow_set_bit_load(jzgc);
+		}
+		if (is_soc_or_above(jzgc->jzpc, ID_X2000))
+			ingenic_gpio_set_bit(jzgc, X2000_GPIO_EDG, offset, val3);
+		raw_spin_unlock_irqrestore(&jzgc->jzpc->shadow_lock, flags);
 	} else {
 		ingenic_gpio_set_bit(jzgc, reg2, offset, val1);
 		ingenic_gpio_set_bit(jzgc, reg1, offset, val2);
@@ -3966,6 +3982,7 @@ static const struct irq_chip ingenic_gpio_irqchip = {
 static int ingenic_pinmux_set_pin_fn(struct ingenic_pinctrl *jzpc,
 		int pin, int func)
 {
+	unsigned long flags;
 	unsigned int idx = pin % PINS_PER_GPIO_CHIP;
 	unsigned int offt = pin / PINS_PER_GPIO_CHIP;
 
@@ -3973,11 +3990,23 @@ static int ingenic_pinmux_set_pin_fn(struct ingenic_pinctrl *jzpc,
 			'A' + offt, idx, func);
 
 	if (is_soc_or_above(jzpc, ID_X1000)) {
-		ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_INT, false);
-		ingenic_shadow_config_pin(jzpc, pin, GPIO_MSK, false);
-		ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_PAT1, func & 0x2);
-		ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_PAT0, func & 0x1);
-		ingenic_shadow_config_pin_load(jzpc, pin);
+		raw_spin_lock_irqsave(&jzpc->shadow_lock, flags);
+		/* Keep X2000 mode updates in the addressed bank. PB23 was observed
+		 * leaving peripheral mode while unrelated PC23 used Port Z.
+		 */
+		if (jzpc->info->version == ID_X2000) {
+			ingenic_config_pin(jzpc, pin, JZ4770_GPIO_INT, false);
+			ingenic_config_pin(jzpc, pin, GPIO_MSK, false);
+			ingenic_config_pin(jzpc, pin, JZ4770_GPIO_PAT1, func & 0x2);
+			ingenic_config_pin(jzpc, pin, JZ4770_GPIO_PAT0, func & 0x1);
+		} else {
+			ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_INT, false);
+			ingenic_shadow_config_pin(jzpc, pin, GPIO_MSK, false);
+			ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_PAT1, func & 0x2);
+			ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_PAT0, func & 0x1);
+			ingenic_shadow_config_pin_load(jzpc, pin);
+		}
+		raw_spin_unlock_irqrestore(&jzpc->shadow_lock, flags);
 	} else if (is_soc_or_above(jzpc, ID_JZ4770)) {
 		ingenic_config_pin(jzpc, pin, JZ4770_GPIO_INT, false);
 		ingenic_config_pin(jzpc, pin, GPIO_MSK, false);
@@ -4035,6 +4064,7 @@ static int ingenic_pinmux_gpio_set_direction(struct pinctrl_dev *pctldev,
 		unsigned int pin, bool input)
 {
 	struct ingenic_pinctrl *jzpc = pinctrl_dev_get_drvdata(pctldev);
+	unsigned long flags;
 	unsigned int idx = pin % PINS_PER_GPIO_CHIP;
 	unsigned int offt = pin / PINS_PER_GPIO_CHIP;
 
@@ -4042,10 +4072,18 @@ static int ingenic_pinmux_gpio_set_direction(struct pinctrl_dev *pctldev,
 			'A' + offt, idx, input ? "in" : "out");
 
 	if (is_soc_or_above(jzpc, ID_X1000)) {
-		ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_INT, false);
-		ingenic_shadow_config_pin(jzpc, pin, GPIO_MSK, true);
-		ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_PAT1, input);
-		ingenic_shadow_config_pin_load(jzpc, pin);
+		raw_spin_lock_irqsave(&jzpc->shadow_lock, flags);
+		if (jzpc->info->version == ID_X2000) {
+			ingenic_config_pin(jzpc, pin, JZ4770_GPIO_INT, false);
+			ingenic_config_pin(jzpc, pin, GPIO_MSK, true);
+			ingenic_config_pin(jzpc, pin, JZ4770_GPIO_PAT1, input);
+		} else {
+			ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_INT, false);
+			ingenic_shadow_config_pin(jzpc, pin, GPIO_MSK, true);
+			ingenic_shadow_config_pin(jzpc, pin, JZ4770_GPIO_PAT1, input);
+			ingenic_shadow_config_pin_load(jzpc, pin);
+		}
+		raw_spin_unlock_irqrestore(&jzpc->shadow_lock, flags);
 	} else if (is_soc_or_above(jzpc, ID_JZ4770)) {
 		ingenic_config_pin(jzpc, pin, JZ4770_GPIO_INT, false);
 		ingenic_config_pin(jzpc, pin, GPIO_MSK, true);
@@ -4081,6 +4119,10 @@ static int ingenic_pinconf_get(struct pinctrl_dev *pctldev,
 	unsigned int arg = 1;
 	unsigned int bias, reg;
 	bool pull, pullup, pulldown;
+
+	if (param == PIN_CONFIG_BIAS_HIGH_IMPEDANCE &&
+	    jzpc->info->version != ID_X2000)
+		return -ENOTSUPP;
 
 	if (is_soc_or_above(jzpc, ID_X2000)) {
 		pullup = ingenic_get_pin_config(jzpc, pin, X2000_GPIO_PEPU) &&
@@ -4121,6 +4163,20 @@ static int ingenic_pinconf_get(struct pinctrl_dev *pctldev,
 	}
 
 	switch (param) {
+	case PIN_CONFIG_BIAS_HIGH_IMPEDANCE:
+		if (jzpc->info->version != ID_X2000)
+			return -ENOTSUPP;
+		/* GPIO input disconnects peripheral/output drive. Bias must also
+		 * be off: an input with a pull-up can feed an unpowered peer.
+		 */
+		if (ingenic_get_pin_config(jzpc, pin, X2000_GPIO_PEPU) ||
+		    ingenic_get_pin_config(jzpc, pin, X2000_GPIO_PEPD) ||
+		    ingenic_get_pin_config(jzpc, pin, JZ4770_GPIO_INT) ||
+		    !ingenic_get_pin_config(jzpc, pin, GPIO_MSK) ||
+		    !ingenic_get_pin_config(jzpc, pin, JZ4770_GPIO_PAT1))
+			return -EINVAL;
+		break;
+
 	case PIN_CONFIG_BIAS_DISABLE:
 		if (pullup || pulldown)
 			return -EINVAL;
@@ -4259,6 +4315,10 @@ static int ingenic_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 
 	for (cfg = 0; cfg < num_configs; cfg++) {
 		switch (pinconf_to_config_param(configs[cfg])) {
+		case PIN_CONFIG_BIAS_HIGH_IMPEDANCE:
+			if (jzpc->info->version != ID_X2000)
+				return -ENOTSUPP;
+			continue;
 		case PIN_CONFIG_BIAS_DISABLE:
 		case PIN_CONFIG_BIAS_PULL_UP:
 		case PIN_CONFIG_BIAS_PULL_DOWN:
@@ -4275,6 +4335,16 @@ static int ingenic_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 		arg = pinconf_to_config_argument(configs[cfg]);
 
 		switch (pinconf_to_config_param(configs[cfg])) {
+		case PIN_CONFIG_BIAS_HIGH_IMPEDANCE:
+			/* Disconnect drive before removing the bias; retain the data
+			 * latch and all unrelated pins, using the bank-local guard.
+			 */
+			ret = ingenic_pinmux_gpio_set_direction(pctldev, NULL, pin, true);
+			if (ret)
+				return ret;
+			ingenic_set_bias(jzpc, pin, GPIO_PULL_DIS);
+			break;
+
 		case PIN_CONFIG_BIAS_DISABLE:
 			dev_dbg(jzpc->dev, "disable pull-over for pin P%c%u\n",
 					'A' + offt, idx);
@@ -4389,6 +4459,7 @@ static const struct regmap_config ingenic_pinctrl_regmap_config = {
 	.reg_bits = 32,
 	.val_bits = 32,
 	.reg_stride = 4,
+	.use_raw_spinlock = true,
 };
 
 static const struct of_device_id ingenic_gpio_of_matches[] __initconst = {
@@ -4483,6 +4554,39 @@ static int __init ingenic_gpio_probe(struct ingenic_pinctrl *jzpc,
 	return 0;
 }
 
+/* X2000 CPM EXCLK_DS bit 30 selects the electrical mode of GPIO bank A.
+ * This must match its board supply before any GPIO consumer drives the bank.
+ * It does not change the supply voltage or MSC2's separate bit-31 domain.
+ */
+static int ingenic_x2000_set_gpa_voltage(struct device *dev)
+{
+	struct device_node *np;
+	struct regmap *cpm;
+	u32 microvolt;
+	int ret;
+
+	if (!device_property_present(dev, "ingenic,gpa-voltage-microvolt"))
+		return 0;
+	if (!of_device_is_compatible(dev->of_node, "ingenic,x2000-pinctrl"))
+		return -EINVAL;
+	ret = device_property_read_u32(dev, "ingenic,gpa-voltage-microvolt", &microvolt);
+	if (ret)
+		return ret;
+	if (microvolt != 1800000 && microvolt != 3300000)
+		return dev_err_probe(dev, -EINVAL, "invalid GPIO A voltage\n");
+
+	np = of_parse_phandle(dev->of_node, "ingenic,cpm", 0);
+	if (!np)
+		return dev_err_probe(dev, -EINVAL, "GPIO A voltage needs CPM\n");
+	cpm = device_node_to_regmap(np);
+	of_node_put(np);
+	if (IS_ERR(cpm))
+		return dev_err_probe(dev, PTR_ERR(cpm), "CPM unavailable\n");
+
+	return regmap_update_bits(cpm, 0xe0, BIT(30),
+				  microvolt == 1800000 ? BIT(30) : 0);
+}
+
 static int __init ingenic_pinctrl_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -4504,6 +4608,7 @@ static int __init ingenic_pinctrl_probe(struct platform_device *pdev)
 	jzpc = devm_kzalloc(dev, sizeof(*jzpc), GFP_KERNEL);
 	if (!jzpc)
 		return -ENOMEM;
+	raw_spin_lock_init(&jzpc->shadow_lock);
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -4522,6 +4627,10 @@ static int __init ingenic_pinctrl_probe(struct platform_device *pdev)
 		dev_err(dev, "Failed to create regmap\n");
 		return PTR_ERR(jzpc->map);
 	}
+
+	err = ingenic_x2000_set_gpa_voltage(dev);
+	if (err)
+		return err;
 
 	jzpc->dev = dev;
 	jzpc->info = chip_info;

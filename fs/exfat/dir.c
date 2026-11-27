@@ -8,9 +8,239 @@
 #include <linux/bio.h>
 #include <linux/buffer_head.h>
 #include <linux/filelock.h>
+#include <linux/moduleparam.h>
+#include <linux/printk.h>
+#include <linux/ratelimit.h>
+#include <linux/smp.h>
+#ifdef CONFIG_MIPS
+#include <asm/addrspace.h>
+#endif
 
 #include "exfat_raw.h"
 #include "exfat_fs.h"
+
+/*
+ * Q2 diagnostic: when exfat_validate_empty_dentry_set() finds a used entry
+ * after an unused one, dump the sector buffer once per mount: the cached
+ * view as each online CPU sees it, the same physical bytes through the
+ * uncached KSEG1 alias (MIPS lowmem), and a fresh read of the sector from
+ * the device into a separate page (bio, not the buffer cache). Hex only,
+ * first EXFAT_DIAG_BYTES bytes; a summary line compares whole sectors.
+ * Entries that hold name characters - File Name (0xc1) and Volume Label
+ * (0x83), in use or deleted (0x41, 0x03), in the view or in the fresh
+ * read - never have bytes 2-31 printed: they show as "..", followed by the
+ * number of those bytes that differ from the fresh read, a mask of their
+ * offsets and how many of the view's differing bytes are zero, printable
+ * ASCII or other. Entry types, flags and every other entry are printed in
+ * full.
+ */
+static bool exfat_dentry_diag = true;
+module_param_named(dentry_diag, exfat_dentry_diag, bool, 0644);
+MODULE_PARM_DESC(dentry_diag, "Dump the sector buffer once per mount on an unused-then-used dentry error (default 1)");
+
+#define EXFAT_DIAG_BYTES	128
+static DEFINE_RATELIMIT_STATE(exfat_diag_rs, 10 * HZ, 1);
+
+struct exfat_diag_copy {
+	const u8 *src;
+	u8 *dst;
+	size_t len;
+	int cpu;
+};
+
+static void exfat_diag_copy_fn(void *arg)
+{
+	struct exfat_diag_copy *c = arg;
+
+	c->cpu = raw_smp_processor_id();
+	memcpy(c->dst, c->src, c->len);
+}
+
+/* File Name or Volume Label entry, in use or deleted. */
+static bool exfat_diag_namelike(u8 type)
+{
+	return (type & 0x7f) == (EXFAT_NAME & 0x7f) || (type & 0x7f) == 0x03;
+}
+
+/*
+ * One line per 32-byte entry. ref is the fresh read, or NULL when it
+ * failed.
+ */
+static void exfat_diag_hex(struct super_block *sb, const char *view, int cpu,
+			   const u8 *buf, const u8 *ref, size_t len)
+{
+	char line[DENTRY_SIZE * 3 + 80];
+	size_t o, i;
+
+	len = min_t(size_t, len, EXFAT_DIAG_BYTES);
+	for (o = 0; o + DENTRY_SIZE <= len; o += DENTRY_SIZE) {
+		bool name = exfat_diag_namelike(buf[o]) ||
+			    (ref && exfat_diag_namelike(ref[o]));
+		unsigned int differ = 0, zero = 0, text = 0, other = 0;
+		u32 mask = 0;
+		char *p = line;
+
+		for (i = 0; i < DENTRY_SIZE; i++) {
+			u8 b = buf[o + i];
+
+			if (!name || i < 2) {
+				p += sprintf(p, " %02x", b);
+				continue;
+			}
+			p += sprintf(p, " ..");
+			if (!ref || b == ref[o + i])
+				continue;
+			differ++;
+			mask |= 1u << (i - 2);
+			if (!b)
+				zero++;
+			else if (b >= 0x20 && b < 0x7f)
+				text++;
+			else
+				other++;
+		}
+		if (name && ref)
+			p += sprintf(p, " name_bytes_differ %u mask 0x%08x zero %u text %u other %u",
+				     differ, mask, zero, text, other);
+		else if (name)
+			p += sprintf(p, " name_bytes not compared");
+		if (cpu >= 0)
+			pr_err("exFAT-fs (%s): diag cpu%d %s %08zx:%s\n",
+			       sb->s_id, cpu, view, o, line);
+		else
+			pr_err("exFAT-fs (%s): diag %s %08zx:%s\n",
+			       sb->s_id, view, o, line);
+	}
+}
+
+/* Bytes that differ between two views, and the first such offset (-1). */
+static size_t exfat_diag_cmp(const u8 *a, const u8 *b, size_t len, long *first)
+{
+	size_t i, n = 0;
+
+	*first = -1;
+	for (i = 0; i < len; i++) {
+		if (a[i] == b[i])
+			continue;
+		if (!n)
+			*first = i;
+		n++;
+	}
+	return n;
+}
+
+static int exfat_diag_read(struct super_block *sb, sector_t block,
+			   struct page *page)
+{
+	struct bio *bio;
+	int ret;
+
+	bio = bio_alloc(sb->s_bdev, 1, REQ_OP_READ | REQ_SYNC, GFP_NOFS);
+	bio->bi_iter.bi_sector = block << (sb->s_blocksize_bits - SECTOR_SHIFT);
+	__bio_add_page(bio, page, sb->s_blocksize, 0);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	return ret;
+}
+
+static void exfat_diag_dentry_buffer(struct super_block *sb,
+				     struct buffer_head *bh, int off)
+{
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	size_t len = bh->b_size, diff;
+	struct exfat_diag_copy c;
+	struct page *page = NULL;
+	u8 *local = NULL, *views = NULL, *uncached = NULL;
+	const u8 *fresh = NULL;
+	int cpu, here, ret, seen[NR_CPUS];
+	bool have_uncached = false;
+	phys_addr_t phys = 0;
+	long first;
+
+	if (!READ_ONCE(exfat_dentry_diag) || sbi->dentry_diag_done ||
+	    len > PAGE_SIZE || !__ratelimit(&exfat_diag_rs))
+		return;
+	sbi->dentry_diag_done = true;
+	local = kmalloc(len, GFP_NOFS);
+	views = kcalloc(nr_cpu_ids, len, GFP_NOFS);
+	uncached = kmalloc(len, GFP_NOFS);
+	page = alloc_page(GFP_NOFS);
+	if (!local || !views || !uncached || !page)
+		goto out;
+
+	for (cpu = 0; cpu < NR_CPUS; cpu++)
+		seen[cpu] = -1;
+	/* Copy every view first; the fresh read decides what is printed. */
+	here = get_cpu();
+	memcpy(local, bh->b_data, len);
+	put_cpu();
+	for_each_online_cpu(cpu) {
+		if (cpu == here)
+			continue;
+		c.src = bh->b_data;
+		c.dst = views + cpu * len;
+		c.len = len;
+		c.cpu = -1;
+		if (!smp_call_function_single(cpu, exfat_diag_copy_fn, &c, 1))
+			seen[cpu] = c.cpu;
+	}
+#ifdef CONFIG_MIPS
+	if (virt_addr_valid(bh->b_data)) {
+		phys = virt_to_phys(bh->b_data);
+		memcpy(uncached, (const void *)CKSEG1ADDR(phys), len);
+		have_uncached = true;
+	}
+#endif
+	ret = exfat_diag_read(sb, bh->b_blocknr, page);
+	if (!ret)
+		fresh = page_address(page);
+
+	exfat_err(sb,
+		  "diag: sector %llu entry offset %d size %zu page offset %lu cpu %d uptodate %d dirty %d",
+		  (unsigned long long)bh->b_blocknr, off, len,
+		  offset_in_page(bh->b_data), here, buffer_uptodate(bh),
+		  buffer_dirty(bh));
+	exfat_diag_hex(sb, "cached", here, local, fresh, len);
+
+	/* The cached view as each other online CPU saw it. */
+	for_each_online_cpu(cpu) {
+		const u8 *view = views + cpu * len;
+
+		if (cpu == here || seen[cpu] < 0)
+			continue;
+		exfat_diag_hex(sb, "cached", seen[cpu], view, fresh, len);
+		diff = exfat_diag_cmp(local, view, len, &first);
+		exfat_err(sb, "diag: cpu%d cached vs cpu%d cached: %zu bytes differ, first at %ld",
+			  here, seen[cpu], diff, first);
+	}
+
+	if (have_uncached) {
+		exfat_diag_hex(sb, "uncached", -1, uncached, fresh, len);
+		diff = exfat_diag_cmp(local, uncached, len, &first);
+		exfat_err(sb, "diag: phys %pa cached vs uncached: %zu bytes differ, first at %ld",
+			  &phys, diff, first);
+	}
+
+	if (!fresh) {
+		exfat_err(sb, "diag: fresh read failed (%d)", ret);
+		goto out;
+	}
+	exfat_diag_hex(sb, "fresh", -1, fresh, fresh, len);
+	diff = exfat_diag_cmp(local, fresh, len, &first);
+	exfat_err(sb, "diag: cached vs fresh read: %zu bytes differ, first at %ld",
+		  diff, first);
+	if (have_uncached) {
+		diff = exfat_diag_cmp(uncached, fresh, len, &first);
+		exfat_err(sb, "diag: uncached vs fresh read: %zu bytes differ, first at %ld",
+			  diff, first);
+	}
+ out:
+	if (page)
+		__free_page(page);
+	kfree(uncached);
+	kfree(views);
+	kfree(local);
+}
 
 static int exfat_extract_uni_name(struct exfat_dentry *ep,
 		unsigned short *uniname)
@@ -880,6 +1110,8 @@ err_used_follow_unused:
 	exfat_fs_error(es->sb,
 		"in sector %lld, dentry %d should be unused, but 0x%x",
 		bh->b_blocknr, off >> DENTRY_SIZE_BITS, ep->type);
+	exfat_diag_dentry_buffer(es->sb, bh,
+				 off & (es->sb->s_blocksize - 1));
 
 	return -EIO;
 

@@ -155,6 +155,17 @@ config SND_MTPAV
 	  To compile this driver as a module, choose M here: the module
 	  will be called snd-mtpav.
 
+config SND_X2000_PWM_AUDIO
+	tristate "Ingenic X2000 PWM audio and tones"
+	depends on PWM_INGENIC_X2000 && INPUT
+	select SND_PCM
+	help
+	  Mono PCM playback and pwm-beeper compatible tones through one
+	  Ingenic X2000 PWM channel, such as the Shanling Q2 clicker.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called snd-x2000-pwm-audio.
+
 config SND_MTS64
 	tristate "ESI Miditerminal 4140 driver"
 	depends on PARPORT

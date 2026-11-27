@@ -34,6 +34,13 @@ config PWRSEQ_SIMPLE
 	  This driver can also be built as a module. If so, the module
 	  will be called pwrseq_simple.
 
+config PWRSEQ_Q2
+	tristate "Shanling Q2 combo-chip power prerequisites"
+	depends on OF && REGULATOR
+	help
+	  Wait for the Q2 combo-chip PMIC supplies before MMC enumeration.
+	  The existing fixed regulators retain ownership of GPIO enables.
+
 config MMC_BLOCK
 	tristate "MMC block device driver"
 	depends on BLOCK

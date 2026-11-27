@@ -12,6 +12,8 @@
 
 #include <asm/cacheflush.h>
 #include <asm/page.h>
+#include <asm/cacheops.h>
+#include <asm/r4kcache.h>
 
 extern const unsigned char relocate_new_kernel[];
 extern const size_t relocate_new_kernel_size;
@@ -168,6 +170,30 @@ void kexec_nonboot_cpu_jump(void)
 }
 #endif
 
+static bool x2000_kexec(void)
+{
+	return IS_ENABLED(CONFIG_INGENIC_X2000_SMP) &&
+		(read_c0_prid() & 0xffffff00) == 0x00132000;
+}
+
+/* X2000 SDK soc/cache.h: 32 KiB L1D/L1I, 512 KiB L2, 32/64-byte
+ * lines, with uncached read barriers around the secondary-cache flush.
+ * The relocated assembly repeats this after copying the new image.
+ */
+static void x2000_kexec_flush(void)
+{
+	unsigned long addr;
+
+	for (addr = CKSEG0; addr < CKSEG0 + 32768; addr += 32)
+		cache_op(Index_Writeback_Inv_D, addr);
+	for (addr = CKSEG0; addr < CKSEG0 + 32768; addr += 32)
+		cache_op(Index_Invalidate_I, addr);
+	__asm__ __volatile__("sync; lw $0, 0(%0)" :: "r" (CKSEG1) : "memory");
+	for (addr = CKSEG0; addr < CKSEG0 + 512 * 1024; addr += 64)
+		cache_op(Index_Writeback_Inv_SD, addr);
+	__asm__ __volatile__("sync; lw $0, 0(%0)" :: "r" (CKSEG1) : "memory");
+}
+
 void kexec_reboot(void)
 {
 	void (*do_kexec)(void) __noreturn;
@@ -202,7 +228,12 @@ void kexec_reboot(void)
 	local_flush_icache_range(reboot_code_buffer,
 				 reboot_code_buffer + relocate_new_kernel_size);
 
-	do_kexec = (void *)reboot_code_buffer;
+	if (x2000_kexec()) {
+		x2000_kexec_flush();
+		do_kexec = (void *)CKSEG1ADDR(reboot_code_buffer);
+	} else {
+		do_kexec = (void *)reboot_code_buffer;
+	}
 	do_kexec();
 }
 

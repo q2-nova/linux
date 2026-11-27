@@ -9,3 +9,14 @@
  */
 
 void inflate_fast (z_streamp strm, unsigned start);
+
+#ifdef ZLIB_INFLATE_VARIANTS
+/* inflate_fast() with chunked copies (inffast_chunk.h); see inflate.c */
+void inflate_fast_chunk8(z_streamp strm, unsigned start);
+void inflate_fast_chunk8_tail(z_streamp strm, unsigned start);
+#ifdef ZLIB_INFLATE_MSA
+void inflate_fast_msa16(z_streamp strm, unsigned start);
+void inflate_fast_msa16_tail(z_streamp strm, unsigned start);
+uLong zlib_adler32_msa(uLong adler, const Byte *buf, uInt len);
+#endif
+#endif

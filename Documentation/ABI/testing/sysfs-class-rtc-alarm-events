@@ -1,0 +1,13 @@
+What: /sys/class/rtc/rtcN/alarm_events
+Date: November 2026
+Contact: Q2 Navidrome developers
+Description:
+ Read-only, version1, non-consuming snapshot of changes/events for the user AIE
+ timer, overflow flag, enabled/deadline, last expiry boottime nanoseconds and
+ the driver-declared alarm wake IRQ (0 means unknown).
+ Fields are protected by the RTC ops lock. Setting/changing AIE increments
+ changes; only the user AIE callback increments events. Internal alarmtimer
+ rtc_timers do not increment events. Counters saturate and overflow prevents
+ maintenance-only attribution. Read never consumes irq_data, opens /dev/rtc,
+ disables an alarm or replaces a user deadline. Bind an open sysfs descriptor
+ to this device instance; rebind/deactivation is not a valid maintenance wake.

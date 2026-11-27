@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/ingenic,x2000-dsi.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Ingenic X2000 MIPI DSI host and PHY
+maintainers:
+  - linux-mips@vger.kernel.org
+allOf:
+  - $ref: dsi-controller.yaml#
+properties:
+  compatible:
+    const: ingenic,x2000-dsi
+  reg:
+    items:
+      - description: Synopsys DSI host registers
+      - description: X2000 DSI PHY registers
+  clocks:
+    maxItems: 1
+  clock-names:
+    const: pclk
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Pixel input from the DPU.
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: DSI output to the panel.
+    required:
+      - port@0
+      - port@1
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - ports
+unevaluatedProperties: false

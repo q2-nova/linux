@@ -417,6 +417,12 @@ config INGENIC_IRQ
 	depends on MACH_INGENIC
 	default y
 
+config INGENIC_X2000_IRQ
+	bool
+	depends on MACH_INGENIC || COMPILE_TEST
+	default MACH_X2000
+	select IRQ_DOMAIN
+
 config INGENIC_TCU_IRQ
 	bool "Ingenic JZ47xx TCU interrupt controller"
 	default MACH_INGENIC

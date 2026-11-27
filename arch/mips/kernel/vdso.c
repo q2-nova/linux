@@ -27,6 +27,24 @@
 
 static_assert(VDSO_NR_PAGES == __VDSO_PAGES);
 
+#ifdef CONFIG_INGENIC_X2000_OST
+/* The X2000 global OST page, or 0 (drivers/clocksource/ingenic-x2000-ost.c). */
+extern unsigned long x2000_ost_vdso_pfn;
+#endif
+
+/* The counter page mapped below the VDSO data: the GIC's user page or the
+ * X2000 OST's. 0 for none. */
+static unsigned long vdso_timer_pfn(void)
+{
+	if (mips_gic_present())
+		return PFN_DOWN(__pa((unsigned long)mips_gic_base + MIPS_GIC_USER_OFS));
+#ifdef CONFIG_INGENIC_X2000_OST
+	return x2000_ost_vdso_pfn;
+#else
+	return 0;
+#endif
+}
+
 static void __init init_vdso_image(struct mips_vdso_image *image)
 {
 	unsigned long num_pages, i;
@@ -79,7 +97,7 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 {
 	struct mips_vdso_image *image = current->thread.abi->vdso;
 	struct mm_struct *mm = current->mm;
-	unsigned long gic_size, size, base, data_addr, vdso_addr, gic_pfn, gic_base;
+	unsigned long gic_size, size, base, data_addr, vdso_addr, gic_pfn;
 	struct vm_area_struct *vma;
 	int ret;
 
@@ -107,7 +125,8 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 	 * only map a page even though the total area is 64K, as we only need
 	 * the counter registers at the start.
 	 */
-	gic_size = mips_gic_present() ? PAGE_SIZE : 0;
+	gic_pfn = vdso_timer_pfn();
+	gic_size = gic_pfn ? PAGE_SIZE : 0;
 	size = gic_size + VDSO_NR_PAGES * PAGE_SIZE + image->size;
 
 	/*
@@ -145,17 +164,19 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 		}
 	}
 
-	/* Map GIC user page. */
+	/* Map the GIC user page or the X2000 OST page. */
 	if (gic_size) {
-		gic_base = (unsigned long)mips_gic_base + MIPS_GIC_USER_OFS;
-		gic_pfn = PFN_DOWN(__pa(gic_base));
 		static const struct vm_special_mapping gic_mapping = {
 			.name	= "[gic]",
 			.pages	= (struct page **) { NULL },
 		};
+		static const struct vm_special_mapping ost_mapping = {
+			.name	= "[ost]",
+			.pages	= (struct page **) { NULL },
+		};
 
 		vma = _install_special_mapping(mm, base, gic_size, VM_READ | VM_MAYREAD,
-					       &gic_mapping);
+					       mips_gic_present() ? &gic_mapping : &ost_mapping);
 		if (IS_ERR(vma)) {
 			ret = PTR_ERR(vma);
 			goto out;

@@ -29,6 +29,7 @@
 #include <linux/string.h>
 #include <linux/cache.h>
 #include <linux/pgtable.h>
+#include <linux/q2-pm-refill-trace.h>
 
 #include <asm/cacheflush.h>
 #include <asm/cpu-type.h>
@@ -39,6 +40,8 @@
 #include <asm/setup.h>
 #include <asm/tlbex.h>
 
+unsigned int q2_refill_trace_enable;
+unsigned int q2_general_trace_enable;
 static int mips_xpa_disabled;
 
 static int __init xpa_disable(char *s)
@@ -178,6 +181,8 @@ enum label_id {
 	label_smp_pgtable_change,
 	label_r3000_write_probe_fail,
 	label_large_segbits_fault,
+	label_q2_refill_entry_done,
+	label_q2_refill_exit_done,
 #ifdef CONFIG_MIPS_HUGE_TLB_SUPPORT
 	label_tlb_huge_update,
 #endif
@@ -1241,6 +1246,42 @@ build_fast_tlb_refill_handler (u32 **p, struct uasm_label **l,
  */
 #define MIPS64_REFILL_INSNS 32
 
+
+/* Inactive Q2 diagnostic. Only reserved K0/K1; no calls, stack or CP0 writes.
+ * The LUI delay slot is safe with the gate off: it never accesses SRAM. */
+static void build_q2_refill_trace(u32 **p,struct uasm_label **l,
+ struct uasm_reloc **r)
+{
+ long gate=(long)&q2_refill_trace_enable;
+ unsigned int start=Q2_RT_OFFSET+8*4;
+ /* Keep K0 as the DRAM gate base through the harmless unarmed delay slot.
+  * Spend the gate before any CP0/SRAM capture; later entries cannot replace it.
+  */
+ uasm_i_lui(p,GPR_K0,uasm_rel_hi(gate));
+ uasm_i_lw(p,GPR_K1,uasm_rel_lo(gate),GPR_K0);
+ uasm_il_beqz(p,r,GPR_K1,label_q2_refill_entry_done);
+ uasm_i_nop(p);
+ uasm_i_sw(p,0,uasm_rel_lo(gate),GPR_K0);
+ uasm_i_lui(p,GPR_K0,uasm_rel_hi(0xb2400000L));
+ uasm_i_mfc0(p,GPR_K1,C0_STATUS);
+ uasm_i_sw(p,GPR_K1,start,GPR_K0);
+ uasm_i_nor(p,GPR_K1,GPR_K1,0);
+ uasm_i_sw(p,GPR_K1,start+12,GPR_K0);
+ uasm_i_mfc0(p,GPR_K1,C0_EPC);
+ uasm_i_sw(p,GPR_K1,start+4,GPR_K0);
+ uasm_i_nor(p,GPR_K1,GPR_K1,0);
+ uasm_i_sw(p,GPR_K1,start+16,GPR_K0);
+ uasm_i_mfc0(p,GPR_K1,C0_ERROREPC);
+ uasm_i_sw(p,GPR_K1,start+8,GPR_K0);
+ uasm_i_nor(p,GPR_K1,GPR_K1,0);
+ uasm_i_sw(p,GPR_K1,start+20,GPR_K0);
+ uasm_i_sync(p,0);
+ uasm_i_ori(p,GPR_K1,0,Q2_RT_ENTRY);
+ uasm_i_sw(p,GPR_K1,Q2_RT_OFFSET+24,GPR_K0);
+ uasm_i_lw(p,GPR_K1,Q2_RT_OFFSET+24,GPR_K0);
+ uasm_build_label(l,*p,label_q2_refill_entry_done);
+}
+
 static void build_r4000_tlb_refill_handler(void)
 {
 	u32 *p = tlb_handler;
@@ -1285,6 +1326,8 @@ static void build_r4000_tlb_refill_handler(void)
 #ifdef CONFIG_64BIT
 		build_get_pmde64(&p, &l, &r, GPR_K0, GPR_K1); /* get pmd in GPR_K1 */
 #else
+  if (read_c0_prid()==0x00132000)
+   build_q2_refill_trace(&p,&l,&r);
 		build_get_pgde32(&p, GPR_K0, GPR_K1); /* get pgd in GPR_K1 */
 #endif
 

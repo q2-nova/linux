@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/watchdog/ingenic,x2000-watchdog.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Ingenic X2000 TCU watchdog
+
+maintainers:
+  - linux-mips@vger.kernel.org
+
+description: |
+  The X2000 TCU watchdog has a 16-bit full counter compare and a separate
+  half compare. This binding covers the watchdog register window only;
+  OST clock events and PWM are separate X2000 blocks.
+
+allOf:
+  - $ref: watchdog.yaml#
+
+properties:
+  compatible:
+    const: ingenic,x2000-watchdog
+  reg:
+    maxItems: 1
+  clocks:
+    items:
+      - description: TCU module gate
+      - description: Watchdog low-frequency mux selected by OPCR bit2
+      - description: Always-available32768Hz diagnostic sleep source
+  clock-names:
+    items:
+      - const: tcu
+      - const: rtc
+      - const: sleep
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+
+unevaluatedProperties: false

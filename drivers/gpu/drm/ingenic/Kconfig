@@ -38,3 +38,19 @@ config DRM_INGENIC_DW_HDMI
 	  select this option.
 
 endif
+
+config DRM_INGENIC_X2000
+	tristate "Ingenic X2000 DPU and DSI"
+	depends on DRM && OF && COMMON_CLK
+	depends on MIPS || COMPILE_TEST
+	select DRM_BRIDGE
+	select DRM_CLIENT_SELECTION
+	select DRM_PANEL_BRIDGE
+	select DRM_KMS_HELPER
+	select DRM_BRIDGE_CONNECTOR
+	select DRM_DISPLAY_HELPER
+	select DRM_GEM_DMA_HELPER
+	select DRM_DW_MIPI_DSI
+	select DRM_MIPI_DSI
+	help
+	  X2000 direct composer and DSI support for the Shanling Q2.

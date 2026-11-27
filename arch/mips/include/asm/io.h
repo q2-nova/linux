@@ -451,6 +451,9 @@ BUILDSTRING(q, u64)
  *    caches.  Dirty lines of the caches may be written back or simply
  *    be discarded.  This operation is necessary before dma operations
  *    to the memory.
+ *  - dma_cache_inv_after(start, size) is the invalidate after a device
+ *    wrote the memory; cache code may order it differently from
+ *    dma_cache_inv(). It falls back to dma_cache_inv().
  *
  * This API used to be exported; it now is for arch code internal use only.
  */
@@ -459,10 +462,38 @@ BUILDSTRING(q, u64)
 extern void (*_dma_cache_wback_inv)(unsigned long start, unsigned long size);
 extern void (*_dma_cache_wback)(unsigned long start, unsigned long size);
 extern void (*_dma_cache_inv)(unsigned long start, unsigned long size);
+extern void (*_dma_cache_inv_after)(unsigned long start, unsigned long size);
+/* c-r4k.c dma_cache.order: 0 upstream, 1 SYNC between L1 and L2 and L2 first after a transfer, 2 and 3 variants of 1 */
+extern unsigned int mips_dma_cache_order;
+/* c-r4k.c dma_cache.shared: all CPUs share their caches, no cache IPIs */
+extern bool mips_cache_shared;
+/*
+ * dma-noncoherent.c dma_cache.verify: a mismatch record for verify_ring.
+ * first and last are offsets in the range of the first and last differing
+ * byte; zero: every differing cached byte is zero.
+ */
+enum { MIPS_DMA_VERIFY_SRC_ARCH, MIPS_DMA_VERIFY_SRC_SDHCI };
+enum { MIPS_DMA_VERIFY_NONE, MIPS_DMA_VERIFY_REPAIRED,
+       MIPS_DMA_VERIFY_UNREPAIRED, MIPS_DMA_VERIFY_MEMORY,
+       MIPS_DMA_VERIFY_UNREPAIRED_MEMORY, MIPS_DMA_VERIFY_SEEN };
+#ifdef CONFIG_MACH_X2000
+/* dma-noncoherent.c dma_cache.dis_pfb: CCU MSCR prefetcher bits */
+u32 x2000_mscr_set_pfb(u32 bits);
+int x2000_dma_set_dis_pfb(unsigned int v);
+#endif
+#ifdef CONFIG_CPU_R4K_CACHE_TLB
+#define MIPS_DMA_VERIFY_REPORT 1
+void mips_dma_verify_report(unsigned int src, phys_addr_t range, size_t len,
+			    size_t first, size_t last, unsigned int ndiff,
+			    bool zero, unsigned int result);
+#endif
 
 #define dma_cache_wback_inv(start, size)	_dma_cache_wback_inv(start, size)
 #define dma_cache_wback(start, size)		_dma_cache_wback(start, size)
 #define dma_cache_inv(start, size)		_dma_cache_inv(start, size)
+#define dma_cache_inv_after(start, size)				\
+	(_dma_cache_inv_after ? _dma_cache_inv_after(start, size) :	\
+				_dma_cache_inv(start, size))
 
 #else /* Sane hardware */
 

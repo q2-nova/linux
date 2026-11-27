@@ -30,6 +30,9 @@ bool events_check_enabled __read_mostly;
 
 /* First wakeup IRQ seen by the kernel in the last cycle. */
 static unsigned int wakeup_irq[2] __read_mostly;
+/* Non-consuming per-admission provenance, protected by wakeup_irq_lock. */
+static unsigned int attribution_irq_events, attribution_system_events;
+static bool attribution_overflow;
 static DEFINE_RAW_SPINLOCK(wakeup_irq_lock);
 
 /* If greater than 0 and the system is suspending, terminate the suspend. */
@@ -894,6 +897,16 @@ EXPORT_SYMBOL_GPL(pm_wakeup_pending);
 
 void pm_system_wakeup(void)
 {
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&wakeup_irq_lock, flags);
+	if (attribution_system_events == UINT_MAX)
+		attribution_overflow = true;
+	else
+		attribution_system_events++;
+	if (attribution_system_events == UINT_MAX)
+		attribution_overflow = true;
+	raw_spin_unlock_irqrestore(&wakeup_irq_lock, flags);
 	atomic_inc(&pm_abort_suspend);
 	s2idle_wake();
 }
@@ -914,6 +927,14 @@ void pm_wakeup_clear(unsigned int irq_number)
 		wakeup_irq[0] = 0;
 
 	wakeup_irq[1] = 0;
+	if (!irq_number) {
+		attribution_irq_events = 0;
+		attribution_system_events = 0;
+		attribution_overflow = false;
+	} else {
+		/* A partial clear makes this admission unsuitable for attribution. */
+		attribution_overflow = true;
+	}
 
 	raw_spin_unlock_irq(&wakeup_irq_lock);
 
@@ -927,12 +948,20 @@ void pm_system_irq_wakeup(unsigned int irq_number)
 
 	raw_spin_lock_irqsave(&wakeup_irq_lock, flags);
 
+	if (attribution_irq_events == UINT_MAX)
+		attribution_overflow = true;
+	else
+		attribution_irq_events++;
+	if (attribution_irq_events == UINT_MAX)
+		attribution_overflow = true;
 	if (wakeup_irq[0] == 0)
 		wakeup_irq[0] = irq_number;
 	else if (wakeup_irq[1] == 0)
 		wakeup_irq[1] = irq_number;
-	else
+	else {
+		attribution_overflow = true;
 		irq_number = 0;
+	}
 
 	pm_pr_dbg("Triggering wakeup from IRQ %d\n", irq_number);
 
@@ -940,6 +969,19 @@ void pm_system_irq_wakeup(unsigned int irq_number)
 
 	if (irq_number)
 		pm_system_wakeup();
+}
+
+void pm_get_wakeup_attribution(struct pm_wakeup_attribution *out)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&wakeup_irq_lock, flags);
+	out->irq[0] = wakeup_irq[0];
+	out->irq[1] = wakeup_irq[1];
+	out->irq_events = attribution_irq_events;
+	out->system_events = attribution_system_events;
+	out->overflow = attribution_overflow;
+	raw_spin_unlock_irqrestore(&wakeup_irq_lock, flags);
 }
 
 unsigned int pm_wakeup_irq(void)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-menu "JZ4740"
+menu "Ingenic"
 
 config SND_JZ4740_SOC_I2S
 	tristate "SoC Audio (I2S protocol) for Ingenic JZ4740 SoC"
@@ -10,5 +10,26 @@ config SND_JZ4740_SOC_I2S
 	help
 	  Say Y if you want to use I2S protocol and I2S codec on Ingenic JZ4740
 	  based boards.
+
+config SND_SOC_X2000
+	tristate "Ingenic X2000 BAIC1 playback"
+	depends on MIPS || COMPILE_TEST
+	depends on HAS_IOMEM && COMMON_CLK
+	help
+	  Playback through audio DMA0, DSP timeslot 9 and BAIC1. Uses the
+	  stock Q2 polling DMA protocol; capture and DMA interrupts are not
+	  supported yet.
+
+config SND_SOC_SHANLING_Q2
+	tristate "Shanling Q2 sound card"
+	depends on OF && I2C && GPIOLIB && RESET_CONTROLLER
+	depends on (MIPS || COMPILE_TEST) && HAS_IOMEM && COMMON_CLK
+	select SND_SOC_X2000
+	select SND_SOC_CS43130
+	select RESET_GPIO
+	help
+	  Q2 stereo PCM playback using BAIC1 and four CS43131 endpoints.
+	  Physical output, supply mapping and high-gain operation require
+	  hardware qualification. The initial integration is emulator-tested.
 
 endmenu

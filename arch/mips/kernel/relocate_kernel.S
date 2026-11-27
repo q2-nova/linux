@@ -10,6 +10,7 @@
 #include <asm/mipsregs.h>
 #include <asm/stackframe.h>
 #include <asm/addrspace.h>
+#include <asm/cacheops.h>
 
 #include <kernel-entry-init.h>
 
@@ -80,6 +81,38 @@ done:
 	PTR_SUB		t0,t0,t2;
 	PTR_ADD		t0,t1,t0;
 	LONG_S		zero,(t0)
+#endif
+
+#ifdef CONFIG_INGENIC_X2000_SMP
+	/* Executing from KSEG1: write back the newly copied image before
+	 * jumping to its cached entry. Match X2000 SDK soc/cache.h ordering.
+	 * Temporary registers only; preserve entry and firmware arguments.
+	 */
+	mfc0		t0, CP0_PRID
+	li		t1, 0xffffff00
+	and		t0, t0, t1
+	li		t1, 0x00132000
+	bne		t0, t1, 4f
+	li		t0, CKSEG0
+	li		t1, CKSEG0 + 32768
+1:	cache		Index_Writeback_Inv_D, 0(t0)
+	addiu		t0, t0, 32
+	bne		t0, t1, 1b
+	li		t0, CKSEG0
+2:	cache		Index_Invalidate_I, 0(t0)
+	addiu		t0, t0, 32
+	bne		t0, t1, 2b
+	li		t2, CKSEG1
+	sync
+	lw		zero, 0(t2)
+	li		t0, CKSEG0
+	li		t1, CKSEG0 + (512 * 1024)
+3:	cache		Index_Writeback_Inv_SD, 0(t0)
+	addiu		t0, t0, 64
+	bne		t0, t1, 3b
+	sync
+	lw		zero, 0(t2)
+4:
 #endif
 
 #ifdef CONFIG_CPU_CAVIUM_OCTEON

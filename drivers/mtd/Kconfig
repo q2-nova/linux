@@ -57,6 +57,17 @@ config MTD_BLOCK
 	  You do not need this option for use with the DiskOnChip devices. For
 	  those, enable NFTL support (CONFIG_NFTL) instead.
 
+config MTD_BLOCK_SKIPBAD
+	tristate "Read-only NAND image with bad blocks omitted"
+	depends on BLOCK
+	select MTD_BLKDEVS
+	select CRYPTO_LIB_SHA256
+	help
+	  Expose read-only NAND partitions as mtdskip devices. Logical
+	  eraseblocks map to successive good physical eraseblocks, matching
+	  images written by nandwrite with its default bad-block skipping.
+	  This is for immutable raw images, not writable filesystems or UBI.
+
 config MTD_BLOCK_RO
 	tristate "Readonly block device access to MTD devices"
 	depends on MTD_BLOCK!=y && BLOCK

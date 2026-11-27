@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/shanling,q2-touchscreen.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Shanling Q2 CST8xxT touchscreen application interface
+
+maintainers:
+  - Linux MIPS List <linux-mips@vger.kernel.org>
+
+description: |
+  The display panel is separate from the Q2 capacitive wheel. PA14 is the
+  active-low controller reset and PA15 signals new reports on a falling edge.
+
+properties:
+  compatible:
+    const: shanling,q2-touchscreen
+  reg:
+    const: 0x15
+  interrupts:
+    maxItems: 1
+  reset-gpios:
+    maxItems: 1
+  vdd-supply:
+    description: Dedicated 2.8 V analog supply from AXP2101 ALDO3.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - reset-gpios
+  - vdd-supply
+
+additionalProperties: false

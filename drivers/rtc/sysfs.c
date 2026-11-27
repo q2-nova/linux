@@ -211,6 +211,28 @@ wakealarm_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(wakealarm);
 
+/* Reading attribution never consumes legacy IRQ data or changes an alarm. */
+static ssize_t alarm_events_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct rtc_device *rtc = to_rtc_device(dev);
+	struct timespec64 expires;
+	int ret;
+
+	mutex_lock(&rtc->ops_lock);
+	expires = ktime_to_timespec64(rtc->aie_timer.node.expires);
+	ret = sysfs_emit(buf, "version=1 changes=%llu events=%llu overflow=%u "
+		"enabled=%u deadline=%lld last_boottime_ns=%llu wake_irq=%u\n",
+		(unsigned long long)rtc->alarm_changes,
+		(unsigned long long)rtc->alarm_events, rtc->alarm_events_overflow,
+		!!rtc->aie_timer.enabled, (long long)expires.tv_sec,
+		(unsigned long long)rtc->alarm_last_boottime_ns, rtc->alarm_wake_irq);
+	mutex_unlock(&rtc->ops_lock);
+	return ret;
+}
+static DEVICE_ATTR_RO(alarm_events);
+
+
 static ssize_t
 offset_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -255,6 +277,7 @@ static struct attribute *rtc_attrs[] = {
 	&dev_attr_max_user_freq.attr,
 	&dev_attr_hctosys.attr,
 	&dev_attr_wakealarm.attr,
+	&dev_attr_alarm_events.attr,
 	&dev_attr_offset.attr,
 	&dev_attr_range.attr,
 	NULL,
@@ -280,7 +303,7 @@ static umode_t rtc_attr_is_visible(struct kobject *kobj,
 	struct rtc_device *rtc = to_rtc_device(dev);
 	umode_t mode = attr->mode;
 
-	if (attr == &dev_attr_wakealarm.attr) {
+	if (attr == &dev_attr_wakealarm.attr || attr == &dev_attr_alarm_events.attr) {
 		if (!rtc_does_wakealarm(rtc))
 			mode = 0;
 	} else if (attr == &dev_attr_offset.attr) {

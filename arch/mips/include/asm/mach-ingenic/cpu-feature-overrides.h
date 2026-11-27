@@ -14,6 +14,14 @@
 #define cpu_has_counter		0
 #define cpu_has_watch		1
 #define cpu_has_divec		1
+/*
+ * Match the stock X2000 SDK exception-vector policy during bring-up.
+ * Config3 advertises VInt, but this path has not been qualified separately.
+ * The earlier Reserved Instruction fault was ERETNC, not evidence that
+ * vectored interrupt delivery is broken; keep that distinction explicit.
+ */
+#define cpu_has_vint		0
+#define cpu_has_veic		0
 #define cpu_has_vce		0
 #define cpu_has_cache_cdex_p	0
 #define cpu_has_cache_cdex_s	0

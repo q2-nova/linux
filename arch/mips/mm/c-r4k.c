@@ -20,6 +20,10 @@
 #include <linux/export.h>
 #include <linux/bitops.h>
 #include <linux/dma-map-ops.h> /* for dma_default_coherent */
+#include <linux/moduleparam.h>
+#include <linux/percpu.h>
+#include <linux/sched/clock.h>
+#include <linux/jump_label.h>
 
 #include <asm/bcache.h>
 #include <asm/bootinfo.h>
@@ -49,6 +53,9 @@
 #define R4K_HIT		BIT(0)
 #define R4K_INDEX	BIT(1)
 
+/* dma_cache.shared, below: all CPUs share their caches. */
+bool mips_cache_shared = true;
+
 /**
  * r4k_op_needs_ipi() - Decide if a cache op needs to be done on every core.
  * @type:	Type of cache operations (R4K_HIT or R4K_INDEX).
@@ -65,6 +72,14 @@
  */
 static inline bool r4k_op_needs_ipi(unsigned int type)
 {
+	/*
+	 * dma_cache.shared: all online CPUs use the same L1 and L2 (the
+	 * X2000's two Linux CPUs are SMT threads of one core), so an operation
+	 * on one CPU reaches every cached copy.
+	 */
+	if (READ_ONCE(mips_cache_shared))
+		return false;
+
 	/* The MIPS Coherence Manager (CM) globalizes address-based cache ops */
 	if (type == R4K_HIT && mips_cm_present())
 		return false;
@@ -745,7 +760,224 @@ static void r4k_flush_icache_user_range(unsigned long start, unsigned long end)
 
 #ifdef CONFIG_DMA_NONCOHERENT
 
-static void r4k_dma_cache_wback_inv(unsigned long addr, unsigned long size)
+/*
+ * DMA cache maintenance variants, /sys/module/dma_cache/parameters/ (boot
+ * parameters dma_cache.NAME=VALUE). For caches that are not inclusive (the
+ * Q2's X2000):
+ *
+ * order 0: upstream. Each operation runs the L1 pass, then the L2 pass, with
+ *          no barrier between them; the invalidate after a transfer is the
+ *          one before it.
+ * order 1: a SYNC between the L1 and the L2 pass, so the L1 operations and
+ *          the write-backs they start have finished before the L2 pass. The
+ *          invalidate after a transfer (dma_sync_*_for_cpu, unmap) runs the
+ *          L2 pass first, then the L1 pass: a line pulled into L1 from L2
+ *          while it runs then comes from memory, which holds the device's
+ *          data, not from an L2 copy filled during the transfer.
+ * order 2: order 1, and the map for a device write (FROM_DEVICE) writes
+ *          back and invalidates instead of invalidating
+ *          (arch/mips/mm/dma-noncoherent.c).
+ * order 3: order 1, and the L1 pass also runs on the other online CPUs by
+ *          IPI when the caller holds nothing that the wait could deadlock
+ *          on (task context, interrupts on, no preemption-disabling lock:
+ *          preempt_count() is only this function's own); otherwise the IPI
+ *          is counted as skipped. A sleeping lock held by the caller is not
+ *          visible here. For supervised measurements only; of use only if
+ *          the CPUs had separate L1 caches.
+ * order 4: order 1, and the invalidate after a transfer runs the L2 and L1
+ *          passes a second time (L2, L1, L2, L1, each followed by a SYNC),
+ *          for fills that were in flight during the first pair.
+ *
+ * shared:  r4k_op_needs_ipi() is false, as with a Coherence Manager: no
+ *          cache IPIs anywhere in this file, and the DMA L1 pass may be a
+ *          whole-L1 index pass from the L1 size up. Only correct when all
+ *          CPUs share their caches.
+ * timing:  each DMA cache operation is timed with local_clock(); stats
+ *          reports count, total and maximum per class (with order 0 the
+ *          invalidate after a transfer is counted as inv_after too).
+ *          Writing stats resets the counts. Off, it costs a patched-out
+ *          branch (static key).
+ */
+unsigned int mips_dma_cache_order = 1;
+static bool dma_cache_timing;
+/* also read by dma_cache.verify (dma-noncoherent.c) */
+DEFINE_STATIC_KEY_FALSE(dma_cache_timing_key);
+
+enum { DMA_C_WBINV, DMA_C_INV, DMA_C_AFTER, DMA_C_CLASSES };
+
+struct dma_cache_time {
+	u64 ns, max;
+	unsigned long n;
+};
+
+static DEFINE_PER_CPU(struct dma_cache_time[DMA_C_CLASSES], dma_cache_times);
+static atomic_t dma_cache_ipis, dma_cache_ipi_skipped;
+
+static __always_inline u64 dma_cache_t0(void)
+{
+	if (static_branch_unlikely(&dma_cache_timing_key))
+		return local_clock();
+	return 0;
+}
+
+static noinline void dma_cache_record(int cls, u64 t0)
+{
+	struct dma_cache_time *t;
+	unsigned long flags;
+	u64 d;
+
+	d = local_clock() - t0;
+	local_irq_save(flags);
+	t = this_cpu_ptr(&dma_cache_times[cls]);
+	t->n++;
+	t->ns += d;
+	if (d > t->max)
+		t->max = d;
+	local_irq_restore(flags);
+}
+
+static __always_inline void dma_cache_t1(int cls, u64 t0)
+{
+	if (static_branch_unlikely(&dma_cache_timing_key) && t0)
+		dma_cache_record(cls, t0);
+}
+
+static int dma_cache_timing_set(const char *val, const struct kernel_param *kp)
+{
+	bool v;
+	int ret = kstrtobool(val, &v);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(dma_cache_timing, v);
+	if (v)
+		static_branch_enable(&dma_cache_timing_key);
+	else
+		static_branch_disable(&dma_cache_timing_key);
+	return 0;
+}
+
+static const struct kernel_param_ops dma_cache_timing_ops = {
+	.set = dma_cache_timing_set,
+	.get = param_get_bool,
+};
+
+static int dma_cache_order_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int v;
+	int ret = kstrtouint(val, 0, &v);
+
+	if (ret)
+		return ret;
+	if (v > 4)
+		return -EINVAL;
+	WRITE_ONCE(mips_dma_cache_order, v);
+	return 0;
+}
+
+static const struct kernel_param_ops dma_cache_order_ops = {
+	.set = dma_cache_order_set,
+	.get = param_get_uint,
+};
+
+static int dma_cache_stats_get(char *buf, const struct kernel_param *kp)
+{
+	static const char *const names[DMA_C_CLASSES] = {
+		"wback_inv", "inv", "inv_after" };
+	int len = 0, c, cpu;
+
+	for (c = 0; c < DMA_C_CLASSES; c++) {
+		u64 ns = 0, mx = 0;
+		unsigned long n = 0;
+
+		for_each_possible_cpu(cpu) {
+			struct dma_cache_time *t = &per_cpu(dma_cache_times, cpu)[c];
+
+			n += t->n;
+			ns += t->ns;
+			mx = max(mx, t->max);
+		}
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s n=%lu ns=%llu max_ns=%llu ",
+				 names[c], n, ns, mx);
+	}
+	len += scnprintf(buf + len, PAGE_SIZE - len, "ipis=%u ipi_skipped=%u\n",
+			 (unsigned int)atomic_read(&dma_cache_ipis),
+			 (unsigned int)atomic_read(&dma_cache_ipi_skipped));
+	return len;
+}
+
+static int dma_cache_stats_set(const char *val, const struct kernel_param *kp)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		unsigned long flags;
+
+		local_irq_save(flags);
+		memset(per_cpu(dma_cache_times, cpu), 0, sizeof(per_cpu(dma_cache_times, cpu)));
+		local_irq_restore(flags);
+	}
+	atomic_set(&dma_cache_ipis, 0);
+	atomic_set(&dma_cache_ipi_skipped, 0);
+	return 0;
+}
+
+static const struct kernel_param_ops dma_cache_stats_ops = {
+	.set = dma_cache_stats_set,
+	.get = dma_cache_stats_get,
+};
+
+#undef MODULE_PARAM_PREFIX
+#define MODULE_PARAM_PREFIX "dma_cache."
+module_param_cb(order, &dma_cache_order_ops, &mips_dma_cache_order, 0644);
+MODULE_PARM_DESC(order, "DMA cache maintenance: 0 upstream, 1 SYNC between L1 and L2 and L2 first after a transfer, 2 also write-back at map for device writes, 3 also the L1 pass on other CPUs by IPI (supervised only), 4 two L2+L1 pairs after a transfer (default 1)");
+module_param_named(shared, mips_cache_shared, bool, 0644);
+MODULE_PARM_DESC(shared, "All CPUs share their caches: no cache IPIs (default 1)");
+module_param_cb(timing, &dma_cache_timing_ops, &dma_cache_timing, 0644);
+MODULE_PARM_DESC(timing, "Time each DMA cache operation (default 0)");
+module_param_cb(stats, &dma_cache_stats_ops, NULL, 0644);
+MODULE_PARM_DESC(stats, "Per class: operations, nanoseconds, maximum; IPIs sent and skipped. Write to reset");
+
+struct dma_cache_remote {
+	unsigned long start, end;
+	bool wback;
+};
+
+static void dma_cache_remote_l1(void *info)
+{
+	struct dma_cache_remote *r = info;
+
+	if (r->wback)
+		blast_dcache_range(r->start, r->end);
+	else
+		blast_inv_dcache_range(r->start, r->end);
+	__sync();
+}
+
+/* order 3: the L1 pass on the other CPUs; the caller holds preemption off. */
+static void dma_cache_remote(unsigned long addr, unsigned long size, bool wback)
+{
+	struct dma_cache_remote r = { addr, addr + size, wback };
+
+	if (READ_ONCE(mips_dma_cache_order) != 3 || !r4k_op_needs_ipi(R4K_HIT))
+		return;
+	/*
+	 * Only unmapped lowmem is the same address on every CPU. The caller of
+	 * this function disabled preemption once: anything above that is a
+	 * lock or section of the DMA API caller, which the wait could
+	 * deadlock against.
+	 */
+	if (!in_task() || irqs_disabled() || preempt_count() != 1 ||
+	    addr < CKSEG0 || addr + size > CKSEG1) {
+		atomic_inc(&dma_cache_ipi_skipped);
+		return;
+	}
+	smp_call_function_many(&cpu_foreign_map[smp_processor_id()],
+			       dma_cache_remote_l1, &r, 1);
+	atomic_inc(&dma_cache_ipis);
+}
+
+static void __r4k_dma_cache_wback_inv(unsigned long addr, unsigned long size)
 {
 	/* Catch bad driver code */
 	if (WARN_ON(size == 0))
@@ -780,10 +1012,21 @@ static void r4k_dma_cache_wback_inv(unsigned long addr, unsigned long size)
 		R4600_HIT_CACHEOP_WAR_IMPL;
 		blast_dcache_range(addr, addr + size);
 	}
+	dma_cache_remote(addr, size, true);
 	preempt_enable();
 
+	if (READ_ONCE(mips_dma_cache_order))
+		__sync();
 	bc_wback_inv(addr, size);
 	__sync();
+}
+
+static void r4k_dma_cache_wback_inv(unsigned long addr, unsigned long size)
+{
+	u64 t0 = dma_cache_t0();
+
+	__r4k_dma_cache_wback_inv(addr, size);
+	dma_cache_t1(DMA_C_WBINV, t0);
 }
 
 static void prefetch_cache_inv(unsigned long addr, unsigned long size)
@@ -811,7 +1054,7 @@ static void prefetch_cache_inv(unsigned long addr, unsigned long size)
 		protected_writeback_scache_line(addr0);
 }
 
-static void r4k_dma_cache_inv(unsigned long addr, unsigned long size)
+static void __r4k_dma_cache_inv(unsigned long addr, unsigned long size)
 {
 	/* Catch bad driver code */
 	if (WARN_ON(size == 0))
@@ -850,10 +1093,72 @@ static void r4k_dma_cache_inv(unsigned long addr, unsigned long size)
 		R4600_HIT_CACHEOP_WAR_IMPL;
 		blast_inv_dcache_range(addr, addr + size);
 	}
+	dma_cache_remote(addr, size, false);
 	preempt_enable();
 
+	if (READ_ONCE(mips_dma_cache_order))
+		__sync();
 	bc_inv(addr, size);
 	__sync();
+}
+
+static void r4k_dma_cache_inv(unsigned long addr, unsigned long size)
+{
+	u64 t0 = dma_cache_t0();
+
+	__r4k_dma_cache_inv(addr, size);
+	dma_cache_t1(DMA_C_INV, t0);
+}
+
+/*
+ * The invalidate after a device has written memory. With order 1-4 and
+ * caches that are not inclusive: L2 pass, SYNC, L1 pass, SYNC (twice with
+ * order 4), and the L2 pass again after an L1 pass that was a whole-L1
+ * index write-back (it can move lines into L2).
+ */
+static void r4k_dma_cache_inv_after(unsigned long addr, unsigned long size)
+{
+	u64 t0;
+	bool index;
+
+	unsigned int order = READ_ONCE(mips_dma_cache_order);
+	int pass;
+
+	if (!order || cpu_has_inclusive_pcaches ||
+	    current_cpu_type() == CPU_BMIPS5000) {
+		/* Counted as after-transfer so classes compare across orders. */
+		t0 = dma_cache_t0();
+		__r4k_dma_cache_inv(addr, size);
+		dma_cache_t1(DMA_C_AFTER, t0);
+		return;
+	}
+	/* Catch bad driver code */
+	if (WARN_ON(size == 0))
+		return;
+
+	t0 = dma_cache_t0();
+	for (pass = 0; pass < (order == 4 ? 2 : 1); pass++) {
+		bc_inv(addr, size);
+		__sync();
+
+		preempt_disable();
+		index = !r4k_op_needs_ipi(R4K_INDEX) && size >= dcache_size;
+		if (index) {
+			r4k_blast_dcache();
+		} else {
+			R4600_HIT_CACHEOP_WAR_IMPL;
+			blast_inv_dcache_range(addr, addr + size);
+		}
+		dma_cache_remote(addr, size, false);
+		preempt_enable();
+		__sync();
+
+		if (index) {
+			bc_inv(addr, size);
+			__sync();
+		}
+	}
+	dma_cache_t1(DMA_C_AFTER, t0);
 }
 #endif /* CONFIG_DMA_NONCOHERENT */
 
@@ -1752,6 +2057,7 @@ void r4k_cache_init(void)
 	_dma_cache_wback_inv	= r4k_dma_cache_wback_inv;
 	_dma_cache_wback	= r4k_dma_cache_wback_inv;
 	_dma_cache_inv		= r4k_dma_cache_inv;
+	_dma_cache_inv_after	= r4k_dma_cache_inv_after;
 #endif /* CONFIG_DMA_NONCOHERENT */
 
 	build_clear_page();

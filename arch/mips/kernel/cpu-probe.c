@@ -1824,6 +1824,11 @@ static inline void cpu_probe_ingenic(struct cpuinfo_mips *c, unsigned int cpu)
 
 	/* XBurst®2 with MXU2.1 SIMD ISA */
 	case PRID_IMP_XBURST2:
+		/* XBurst2 Core PM, Table 6-2: CCA1 is uncached write accelerated. */
+		c->writecombine = _CACHE_CACHABLE_WA;
+		/* XBurst2 Core PM: IE=3 invalidates the entire VTLB/FTLB. */
+		if (((read_c0_config4() & MIPS_CONF4_IE) >> 29) == 3)
+			c->options |= MIPS_CPU_TLBINV;
 		c->cputype = CPU_XBURST;
 		__cpu_name[cpu] = "Ingenic XBurst II";
 		break;

@@ -13,6 +13,7 @@ snd-portman2x4-y := portman2x4.o
 snd-serial-u16550-y := serial-u16550.o
 snd-serial-generic-y := serial-generic.o
 snd-virmidi-y := virmidi.o
+snd-x2000-pwm-audio-y := x2000-pwm-audio.o
 
 # Toplevel Module Dependency
 obj-$(CONFIG_SND_DUMMY) += snd-dummy.o
@@ -24,5 +25,6 @@ obj-$(CONFIG_SND_SERIAL_GENERIC) += snd-serial-generic.o
 obj-$(CONFIG_SND_MTPAV) += snd-mtpav.o
 obj-$(CONFIG_SND_MTS64) += snd-mts64.o
 obj-$(CONFIG_SND_PORTMAN2X4) += snd-portman2x4.o
+obj-$(CONFIG_SND_X2000_PWM_AUDIO) += snd-x2000-pwm-audio.o
 
 obj-$(CONFIG_SND) += opl3/ opl4/ mpu401/ vx/ pcsp/

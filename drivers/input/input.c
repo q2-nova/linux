@@ -21,6 +21,8 @@
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/pm.h>
+#include <linux/pm_wakeup.h>
+#include <linux/property.h>
 #include <linux/poll.h>
 #include <linux/device.h>
 #include <linux/kstrtox.h>
@@ -364,6 +366,13 @@ void input_handle_event(struct input_dev *dev,
 
 	disposition = input_get_disposition(dev, type, code, &value);
 	if (disposition != INPUT_IGNORE_EVENT) {
+		/* Count accepted intent before evdev can publish it. The ordinary
+		 * wakeup_count store/pending checks then close userspace admission.
+		 * Releases from PM callbacks do not create a self-aborting event.
+		 */
+		if (dev->suspend_guard &&
+		    ((type == EV_KEY && value) || (type == EV_ABS && code == ABS_X)))
+			__pm_wakeup_event(dev->suspend_guard, 0);
 		if (type != EV_SYN)
 			add_input_randomness(type, code, value);
 
@@ -757,6 +766,10 @@ static bool input_dev_release_keys(struct input_dev *dev)
 static void input_disconnect_device(struct input_dev *dev)
 {
 	struct input_handle *handle;
+
+	/* Descriptor loss must also invalidate a previously saved PM count. */
+	if (dev->suspend_guard)
+		__pm_wakeup_event(dev->suspend_guard, 0);
 
 	/*
 	 * Mark device as going away. Note that we take dev->mutex here
@@ -1512,6 +1525,13 @@ static ssize_t inhibited_store(struct device *dev,
 
 static DEVICE_ATTR_RW(inhibited);
 
+static ssize_t suspend_guard_show(struct device *device,
+				  struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", !!to_input_dev(device)->suspend_guard);
+}
+static DEVICE_ATTR_RO(suspend_guard);
+
 static struct attribute *input_dev_attrs[] = {
 	&dev_attr_name.attr,
 	&dev_attr_phys.attr,
@@ -1519,6 +1539,7 @@ static struct attribute *input_dev_attrs[] = {
 	&dev_attr_modalias.attr,
 	&dev_attr_properties.attr,
 	&dev_attr_inhibited.attr,
+	&dev_attr_suspend_guard.attr,
 	NULL
 };
 
@@ -1636,6 +1657,7 @@ static void input_dev_release(struct device *device)
 {
 	struct input_dev *dev = to_input_dev(device);
 
+	wakeup_source_unregister(dev->suspend_guard);
 	input_ff_destroy(dev);
 	input_mt_destroy_slots(dev);
 	kfree(dev->poller);
@@ -2416,6 +2438,15 @@ int input_register_device(struct input_dev *dev)
 	error = input_device_tune_vals(dev);
 	if (error)
 		goto err_devres_free;
+
+	if (dev->dev.parent && !dev->suspend_guard &&
+	    device_property_read_bool(dev->dev.parent, "linux,suspend-input-guard")) {
+		dev->suspend_guard = wakeup_source_register(&dev->dev, "input-admission");
+		if (!dev->suspend_guard) {
+			error = -ENOMEM;
+			goto err_devres_free;
+		}
+	}
 
 	/*
 	 * If delay and period are pre-set by the driver, then autorepeating

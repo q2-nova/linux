@@ -719,6 +719,17 @@ config INGENIC_TIMER
 	help
 	  Support for the timer/counter unit of the Ingenic JZ SoCs.
 
+config INGENIC_X2000_OST
+	bool "Clocksource and clockevents for the Ingenic X2000 OST"
+	default MACH_X2000
+	depends on MIPS || COMPILE_TEST
+	depends on COMMON_CLK
+	select TIMER_OF
+	select CLKSRC_MMIO
+	help
+	  Support for the global 64-bit and per-core 32-bit operating system
+	  timers of the Ingenic X2000.
+
 config INGENIC_SYSOST
 	bool "Clocksource/timer using the SYSOST in Ingenic X SoCs"
 	depends on MIPS || COMPILE_TEST

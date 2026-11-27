@@ -475,6 +475,11 @@ extern void pm_system_cancel_wakeup(void);
 extern void pm_wakeup_clear(unsigned int irq_number);
 extern void pm_system_irq_wakeup(unsigned int irq_number);
 extern unsigned int pm_wakeup_irq(void);
+struct pm_wakeup_attribution {
+	unsigned int irq[2], irq_events, system_events;
+	bool overflow;
+};
+extern void pm_get_wakeup_attribution(struct pm_wakeup_attribution *out);
 extern bool pm_get_wakeup_count(unsigned int *count, bool block);
 extern bool pm_save_wakeup_count(unsigned int count);
 extern void pm_wakep_autosleep_enabled(bool set);

@@ -12,5 +12,10 @@ obj-$(CONFIG_YAMON_DT_SHIM)		+= yamon-dt.o
 obj-$(CONFIG_LEGACY_BOARD_SEAD3)	+= board-sead3.o
 obj-$(CONFIG_LEGACY_BOARD_OCELOT)	+= board-ocelot.o
 obj-$(CONFIG_MACH_INGENIC)			+= board-ingenic.o
+obj-$(CONFIG_INGENIC_X2000_SMP)		+= smp-ingenic-x2000.o
+obj-$(CONFIG_INGENIC_X2000_SMP)		+= smp-ingenic-x2000-entry.o
 obj-$(CONFIG_VIRT_BOARD_RANCHU)		+= board-ranchu.o
 obj-$(CONFIG_MACH_REALTEK_RTL)		+= board-realtek.o
+ifeq ($(CONFIG_MACH_X2000),y)
+obj-$(CONFIG_SUSPEND) += pm-ingenic-x2000.o pm-ingenic-x2000-sram.o
+endif

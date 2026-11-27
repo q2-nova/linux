@@ -339,3 +339,242 @@ void inflate_fast(z_streamp strm, unsigned start)
  */
 
 #endif /* !ASMINF */
+
+#ifdef ZLIB_INFLATE_VARIANTS
+/*
+ * Chunked match copies for the inflate_fast() variants (inffast_chunk.h).
+ * COPY_FAR(out, from, len): len >= 1 bytes from a source that is in another
+ * buffer or at least one chunk behind out; writes and reads whole chunks.
+ * COPY_NEAR(out, dist, len): len >= 1 bytes from out - dist; returns out + len.
+ */
+#include <linux/unaligned.h>
+
+static __always_inline void inffast_copy_far8(unsigned char *out,
+		const unsigned char *from, unsigned len)
+{
+    do {
+        u32 a = get_unaligned((const u32 *)from);
+        u32 b = get_unaligned((const u32 *)(from + 4));
+
+        put_unaligned(a, (u32 *)out);
+        put_unaligned(b, (u32 *)(out + 4));
+        out += 8;
+        from += 8;
+    } while (len > 8 ? (len -= 8, 1) : 0);
+}
+
+static __always_inline unsigned char *inffast_copy_near8(unsigned char *out,
+		unsigned dist, unsigned len)
+{
+    unsigned char *end = out + len;
+    u32 v;
+
+    if (dist >= 8) {
+        inffast_copy_far8(out, out - dist, len);
+        return end;
+    }
+    switch (dist) {
+    case 1:
+        v = out[-1] * 0x01010101u;
+        break;
+    case 2:
+        v = get_unaligned((const u16 *)(out - 2)) * 0x00010001u;
+        break;
+    case 4:
+        v = get_unaligned((const u32 *)(out - 4));
+        break;
+    default: {
+        const unsigned char *from = out - dist;
+
+        do {
+            *out++ = *from++;
+        } while (--len);
+        return end;
+    }
+    }
+    do {
+        put_unaligned(v, (u32 *)out);
+        put_unaligned(v, (u32 *)(out + 4));
+        out += 8;
+    } while (out < end);
+    return end;
+}
+
+#ifdef ZLIB_INFLATE_MSA
+#define INFFAST_MSA_BEGIN ".set push\n\t.set reorder\n\t.set noat\n\t" \
+                          ".set hardfloat\n\t.set fp=64\n\t.set msa\n\t"
+#define INFFAST_MSA_END ".set pop\n\t"
+
+static __always_inline void inffast_copy_far16(unsigned char *out,
+		const unsigned char *from, unsigned len)
+{
+    unsigned char *end = out + len;
+
+    __asm__ __volatile__(
+        INFFAST_MSA_BEGIN
+        "1:\n\t"
+        "ld.b $w0, 0(%[from])\n\t"
+        "addiu %[from], %[from], 16\n\t"
+        "st.b $w0, 0(%[out])\n\t"
+        "addiu %[out], %[out], 16\n\t"
+        "sltu $1, %[out], %[end]\n\t"
+        "bnez $1, 1b\n\t"
+        INFFAST_MSA_END
+        : [out] "+r" (out), [from] "+r" (from)
+        : [end] "r" (end)
+        : "$1", "memory");
+}
+
+/* vshf.b control: element i takes source byte i % dist */
+static const unsigned char inffast_pattern[16][16] __aligned(16) = {
+#define P(d) { 0 % d, 1 % d, 2 % d, 3 % d, 4 % d, 5 % d, 6 % d, 7 % d, \
+               8 % d, 9 % d, 10 % d, 11 % d, 12 % d, 13 % d, 14 % d, 15 % d }
+    { 0 }, P(1), P(2), P(3), P(4), P(5), P(6), P(7),
+    P(8), P(9), P(10), P(11), P(12), P(13), P(14), P(15)
+#undef P
+};
+
+static __always_inline unsigned char *inffast_copy_near16(unsigned char *out,
+		unsigned dist, unsigned len)
+{
+    unsigned char *end = out + len;
+    unsigned adv;
+
+    if (dist >= 16) {
+        inffast_copy_far16(out, out - dist, len);
+        return end;
+    }
+    /* one 16-byte pattern of period dist, stored every 16 - 16 % dist bytes */
+    adv = 16 - 16 % dist;
+    __asm__ __volatile__(
+        INFFAST_MSA_BEGIN
+        "ld.b $w0, 0(%[src])\n\t"
+        "ld.b $w1, 0(%[ctl])\n\t"
+        "vshf.b $w1, $w0, $w0\n\t"
+        "1:\n\t"
+        "st.b $w1, 0(%[out])\n\t"
+        "addu %[out], %[out], %[adv]\n\t"
+        "sltu $1, %[out], %[end]\n\t"
+        "bnez $1, 1b\n\t"
+        INFFAST_MSA_END
+        : [out] "+r" (out)
+        : [src] "r" (out - dist), [ctl] "r" (inffast_pattern[dist]),
+          [adv] "r" (adv), [end] "r" (end)
+        : "$1", "memory");
+    return end;
+}
+#endif /* ZLIB_INFLATE_MSA */
+
+#define INFLATE_FAST_NAME inflate_fast_chunk8
+#define CHUNK_MSA 0
+#define CHUNK_TAIL 0
+#include "inffast_chunk.h"
+
+#define INFLATE_FAST_NAME inflate_fast_chunk8_tail
+#define CHUNK_MSA 0
+#define CHUNK_TAIL 1
+#include "inffast_chunk.h"
+
+#ifdef ZLIB_INFLATE_MSA
+#define INFLATE_FAST_NAME inflate_fast_msa16
+#define CHUNK_MSA 1
+#define CHUNK_TAIL 0
+#include "inffast_chunk.h"
+
+#define INFLATE_FAST_NAME inflate_fast_msa16_tail
+#define CHUNK_MSA 1
+#define CHUNK_TAIL 1
+#include "inffast_chunk.h"
+
+/*
+ * Adler-32 with MSA, 32 bytes per step: for a run of n bytes after which
+ * the sums were s1, s2,
+ *   s1' = s1 + sum(b),   s2' = s2 + n * s1 + sum((n - i) * b[i]).
+ * Per 32-byte step j with byte sum S_j and W_j = sum((32 - i) * b[32j + i]):
+ *   sum((n - i) * b[i]) = 32 * sum over j of (S_0 + ... + S_{j-1}) + sum(W_j).
+ * Vector lanes hold S (w3), the running prefix sum PS (w4) and W (w5) over
+ * at most ADLER_MSA_RUN bytes, small enough that no u32 lane overflows; the
+ * scalar code reduces modulo 65521 after each run, as zlib_adler32() does.
+ */
+#define ADLER_BASE 65521U
+#define ADLER_MSA_RUN 4096U
+
+static const unsigned char adler_weights[32] __aligned(16) = {
+    32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+    16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1
+};
+
+uLong zlib_adler32_msa(uLong adler, const Byte *buf, uInt len)
+{
+    unsigned long s1 = adler & 0xffff;
+    unsigned long s2 = (adler >> 16) & 0xffff;
+
+    if (buf == NULL)
+        return 1L;
+
+    while (len >= 32) {
+        unsigned n = len < ADLER_MSA_RUN ? len & ~31U : ADLER_MSA_RUN;
+        const Byte *p = buf, *end = buf + n;
+        unsigned long s, ps, w;
+        u32 l0, l1, l2, l3, m0, m1, m2, m3, n0, n1, n2, n3;
+
+        __asm__ __volatile__(
+            INFFAST_MSA_BEGIN
+            "ld.b $w6, 0(%[wt])\n\t"
+            "ld.b $w7, 16(%[wt])\n\t"
+            "ldi.b $w3, 0\n\t"
+            "ldi.b $w4, 0\n\t"
+            "ldi.b $w5, 0\n\t"
+            "1:\n\t"
+            "ld.b $w0, 0(%[p])\n\t"
+            "ld.b $w1, 16(%[p])\n\t"
+            "addv.w $w4, $w4, $w3\n\t"
+            "hadd_u.h $w8, $w0, $w0\n\t"
+            "hadd_u.h $w9, $w1, $w1\n\t"
+            "dotp_u.h $w10, $w0, $w6\n\t"
+            "dotp_u.h $w11, $w1, $w7\n\t"
+            "addv.h $w8, $w8, $w9\n\t"
+            "addv.h $w10, $w10, $w11\n\t"
+            "hadd_u.w $w8, $w8, $w8\n\t"
+            "hadd_u.w $w10, $w10, $w10\n\t"
+            "addiu %[p], %[p], 32\n\t"
+            "addv.w $w3, $w3, $w8\n\t"
+            "addv.w $w5, $w5, $w10\n\t"
+            "bne %[p], %[end], 1b\n\t"
+            "copy_s.w %[l0], $w3[0]\n\t"
+            "copy_s.w %[l1], $w3[1]\n\t"
+            "copy_s.w %[l2], $w3[2]\n\t"
+            "copy_s.w %[l3], $w3[3]\n\t"
+            "copy_s.w %[m0], $w4[0]\n\t"
+            "copy_s.w %[m1], $w4[1]\n\t"
+            "copy_s.w %[m2], $w4[2]\n\t"
+            "copy_s.w %[m3], $w4[3]\n\t"
+            "copy_s.w %[n0], $w5[0]\n\t"
+            "copy_s.w %[n1], $w5[1]\n\t"
+            "copy_s.w %[n2], $w5[2]\n\t"
+            "copy_s.w %[n3], $w5[3]\n\t"
+            INFFAST_MSA_END
+            : [p] "+r" (p), [l0] "=&r" (l0), [l1] "=&r" (l1), [l2] "=&r" (l2),
+              [l3] "=&r" (l3), [m0] "=&r" (m0), [m1] "=&r" (m1), [m2] "=&r" (m2),
+              [m3] "=&r" (m3), [n0] "=&r" (n0), [n1] "=&r" (n1), [n2] "=&r" (n2),
+              [n3] "=&r" (n3)
+            : [end] "r" (end), [wt] "r" (adler_weights)
+            : "memory");
+        s = l0 + l1 + l2 + l3;
+        ps = (unsigned long)(m0 + m1 + m2 + m3) % ADLER_BASE;
+        w = n0 + n1 + n2 + n3;
+        s2 = (s2 + n * s1 + 32 * ps + w) % ADLER_BASE;
+        s1 = (s1 + s) % ADLER_BASE;
+        buf += n;
+        len -= n;
+    }
+    while (len--) {
+        s1 += *buf++;
+        s2 += s1;
+    }
+    s1 %= ADLER_BASE;
+    s2 %= ADLER_BASE;
+    return (s2 << 16) | s1;
+}
+#endif /* ZLIB_INFLATE_MSA */
+#endif /* ZLIB_INFLATE_VARIANTS */

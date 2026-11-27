@@ -65,6 +65,20 @@ properties:
   "#size-cells":
     const: 0
 
+  ingenic,cpm:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: X2000 clock and power management register block.
+
+  ingenic,gpa-voltage-microvolt:
+    enum: [1800000, 3300000]
+    description: |
+      X2000 GPIO bank A electrical operating voltage. Must match the fixed
+      board supply; this configures the pads, not the regulator. If omitted,
+      preserve the boot firmware setting. Requires ingenic,cpm.
+
+dependencies:
+  ingenic,gpa-voltage-microvolt: [ingenic,cpm]
+
 patternProperties:
   "^gpio@[0-9]$":
     type: object
@@ -140,6 +154,8 @@ additionalProperties:
         function: true
         groups: true
         pins: true
+        bias-high-impedance:
+          description: X2000 GPIO input with both internal pulls disabled.
         bias-disable: true
         bias-pull-up: true
         bias-pull-down: true
@@ -158,6 +174,8 @@ additionalProperties:
           function: true
           groups: true
           pins: true
+          bias-high-impedance:
+            description: X2000 GPIO input with both internal pulls disabled.
           bias-disable: true
           bias-pull-up: true
           bias-pull-down: true

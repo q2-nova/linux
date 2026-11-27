@@ -26,6 +26,10 @@ struct inflate_workspace {
 	unsigned char working_window[(1 << MAX_WBITS) + PAGE_SIZE];
 #else
 	unsigned char working_window[(1 << MAX_WBITS)];
+#ifdef ZLIB_INFLATE_VARIANTS
+	/* chunked window copies read up to 15 bytes past the window */
+	unsigned char working_window_pad[16];
+#endif
 #endif
 };
 

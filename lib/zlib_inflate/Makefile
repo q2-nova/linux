@@ -18,3 +18,7 @@ obj-$(CONFIG_ZLIB_INFLATE) += zlib_inflate.o
 
 zlib_inflate-objs := inffast.o inflate.o infutil.o \
 		     inftrees.o inflate_syms.o
+
+# Q2: the decompressor at -O2 instead of CONFIG_CC_OPTIMIZE_FOR_SIZE (the
+# last -O wins); measured in tests/perf/decomp.
+ccflags-y += -O2

@@ -11,3 +11,14 @@ config PHY_INGENIC_USB
 	help
 	  This driver provides USB PHY support for the USB controller found
 	  on the JZ-series and X-series SoCs from Ingenic.
+
+config PHY_INGENIC_X2000_USB
+	tristate "Ingenic X2000 CPM/analog USB PHY"
+	depends on MIPS || COMPILE_TEST
+	depends on USB_SUPPORT && HAS_IOMEM
+	select GENERIC_PHY
+	help
+	  Generic PHY API for the X2000 vendor CPM and analog register sequence.
+	  Requires board power supplies to be enabled by firmware.
+	  Controls both the CPM reset fields and the analog receiver bank.
+	  Used with the DWC2 peripheral controller on the Shanling Q2.

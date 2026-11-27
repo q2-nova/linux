@@ -3759,7 +3759,11 @@ irq_retry:
 		/* Reset device address to zero */
 		dwc2_clear_bit(hsotg, DCFG, DCFG_DEVADDR_MASK);
 
-		if (usb_status & GOTGCTL_BSESVLD && connected)
+		/* Session-end already clears connected and leaves L3. A new
+		 * bus reset with valid VBUS must rearm EP0 from that state too.
+		 */
+		if (usb_status & GOTGCTL_BSESVLD &&
+		    (connected || hsotg->lx_state == DWC2_L3))
 			dwc2_hsotg_core_init_disconnected(hsotg, true);
 	}
 

@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/mmc/shanling,q2-wifi-pwrseq.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Shanling Q2 Wi-Fi power prerequisites
+
+maintainers:
+  - linux-mips@vger.kernel.org
+
+description: |
+  The Q2 combo chip requires three AXP2101 rails before MSC1 enumeration.
+  The rails are shared and retain the board's always-on constraints. This
+  provider establishes supply readiness; the separate vmmc fixed-regulator
+  chain owns BT_DIS_N, WL_DIS_N and their existing power-on delays. The rail
+  names identify the observed PMIC outputs, not an inferred electrical topology.
+
+properties:
+  compatible:
+    const: shanling,q2-wifi-pwrseq
+  aldo1-supply: true
+  bldo1-supply: true
+  bldo2-supply: true
+
+required:
+  - compatible
+  - aldo1-supply
+  - bldo1-supply
+  - bldo2-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    wifi-pwrseq {
+        compatible = "shanling,q2-wifi-pwrseq";
+        aldo1-supply = <&aldo1>;
+        bldo1-supply = <&bldo1>;
+        bldo2-supply = <&bldo2>;
+    };

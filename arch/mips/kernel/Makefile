@@ -50,6 +50,7 @@ obj-y				+= $(sw-y)
 obj-$(CONFIG_MIPS_FP_SUPPORT)	+= fpu-probe.o
 obj-$(CONFIG_CPU_R2300_FPU)	+= r2300_fpu.o
 obj-$(CONFIG_CPU_R4K_FPU)	+= r4k_fpu.o
+obj-$(CONFIG_CPU_HAS_MSA)	+= kernel-msa.o
 
 obj-$(CONFIG_SMP)		+= smp.o
 obj-$(CONFIG_SMP_UP)		+= smp-up.o

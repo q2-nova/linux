@@ -15,6 +15,68 @@
 #include "inffast.h"
 #include "infutil.h"
 
+#ifdef ZLIB_INFLATE_VARIANTS
+#include <linux/moduleparam.h>
+#ifdef ZLIB_INFLATE_MSA
+#include <asm/kernel-msa.h>
+#endif
+
+/*
+ * /sys/module/zlib_inflate/parameters/fast_variant, read at every
+ * zlib_inflate() call:
+ *   0  inflate_fast() as upstream
+ *   1  8-byte chunked match copies (unaligned 32-bit loads and stores)
+ *   2  as 1, and decode up to the end of the output buffer (default)
+ *   3  16-byte MSA chunked match copies
+ *   4  as 3, and decode up to the end of the output buffer
+ * adler_variant: 0 zlib_adler32() as upstream (default), 1 MSA.
+ * Kernel-mode MSA here, with both CPUs online, stopped the Q2 within
+ * seconds in the card-loop reproducer; 2 and 0 ran clean (2026-11-21).
+ * The MSA variants fall back to 2 and 0 when kernel_msa_begin() refuses
+ * (interrupt context, interrupts off, no MSA) and when the kernel is built
+ * without MSA support.
+ */
+unsigned int zlib_inflate_fast_variant = 2;
+unsigned int zlib_inflate_adler_variant;
+module_param_named(fast_variant, zlib_inflate_fast_variant, uint, 0644);
+module_param_named(adler_variant, zlib_inflate_adler_variant, uint, 0644);
+
+static inline uLong zlib_inflate_adler(const struct inflate_state *state,
+                                       uLong adler, const Byte *buf, uInt len)
+{
+#ifdef ZLIB_INFLATE_MSA
+    if (state->simd && READ_ONCE(zlib_inflate_adler_variant) == 1)
+        return zlib_adler32_msa(adler, buf, len);
+#endif
+    return zlib_adler32(adler, buf, len);
+}
+
+static void zlib_inflate_fast(z_streamp strm, unsigned start)
+{
+    switch (((struct inflate_state *)strm->state)->fast) {
+    case 1:
+        inflate_fast_chunk8(strm, start);
+        break;
+    case 2:
+        inflate_fast_chunk8_tail(strm, start);
+        break;
+#ifdef ZLIB_INFLATE_MSA
+    case 3:
+        inflate_fast_msa16(strm, start);
+        break;
+    case 4:
+        inflate_fast_msa16_tail(strm, start);
+        break;
+#endif
+    default:
+        inflate_fast(strm, start);
+    }
+}
+#else
+#define zlib_inflate_adler(state, adler, buf, len) zlib_adler32(adler, buf, len)
+#define zlib_inflate_fast(strm, start) inflate_fast(strm, start)
+#endif
+
 /* architecture-specific bits */
 #ifdef CONFIG_ZLIB_DFLTCC
 #  include "../zlib_dfltcc/dfltcc_inflate.h"
@@ -51,6 +113,10 @@ int zlib_inflateReset(z_streamp strm)
     state->wsize = 1U << state->wbits;
     state->write = 0;
     state->whave = 0;
+#ifdef ZLIB_INFLATE_VARIANTS
+    state->fast = 0;
+    state->simd = 0;
+#endif
 
     INFLATE_RESET_HOOK(strm);
     return Z_OK;
@@ -179,7 +245,7 @@ static int zlib_inflateSyncPacket(z_streamp strm)
 /* Macros for inflate(): */
 
 /* check function to use adler32() for zlib or crc32() for gzip */
-#define UPDATE(check, buf, len) zlib_adler32(check, buf, len)
+#define UPDATE(check, buf, len) zlib_inflate_adler(state, check, buf, len)
 
 /* Load registers with state in inflate() for speed */
 #define LOAD() \
@@ -328,7 +394,7 @@ static int zlib_inflateSyncPacket(z_streamp strm)
    will return Z_BUF_ERROR if it has not reached the end of the stream.
  */
 
-int zlib_inflate(z_streamp strm, int flush)
+static int zlib_inflate_run(z_streamp strm, int flush)
 {
     struct inflate_state *state;
     const unsigned char *next;  /* next input */
@@ -579,7 +645,7 @@ int zlib_inflate(z_streamp strm, int flush)
         case LEN:
             if (have >= 6 && left >= 258) {
                 RESTORE();
-                inflate_fast(strm, out);
+                zlib_inflate_fast(strm, out);
                 LOAD();
                 break;
             }
@@ -765,6 +831,36 @@ int zlib_inflate(z_streamp strm, int flush)
         ret = Z_BUF_ERROR;
 
     return ret;
+}
+
+int zlib_inflate(z_streamp strm, int flush)
+{
+#ifdef ZLIB_INFLATE_VARIANTS
+    struct inflate_state *state;
+    unsigned fast;
+    int ret;
+
+    if (strm == NULL || strm->state == NULL)
+        return Z_STREAM_ERROR;
+    state = (struct inflate_state *)strm->state;
+    fast = READ_ONCE(zlib_inflate_fast_variant);
+#ifdef ZLIB_INFLATE_MSA
+    /* one MSA section per call: the caller's whole output buffer */
+    if ((fast == 3 || fast == 4 || READ_ONCE(zlib_inflate_adler_variant) == 1) &&
+            kernel_msa_begin()) {
+        state->fast = fast;
+        state->simd = 1;
+        ret = zlib_inflate_run(strm, flush);
+        state->simd = 0;
+        kernel_msa_end();
+        return ret;
+    }
+#endif
+    state->fast = fast == 3 ? 1 : fast == 4 ? 2 : fast;
+    return zlib_inflate_run(strm, flush);
+#else
+    return zlib_inflate_run(strm, flush);
+#endif
 }
 
 int zlib_inflateEnd(z_streamp strm)

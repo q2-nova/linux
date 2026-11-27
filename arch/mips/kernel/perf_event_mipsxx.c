@@ -950,6 +950,18 @@ static const struct mips_perf_event mipsxxcore_event_map2
 	[PERF_COUNT_HW_BRANCH_MISSES] = { 0x27, CNTR_ODD, T },
 };
 
+/*
+ * Ingenic XBurst/XBurst II: event numbers from Ingenic's 5.10 SDK. Events 0
+ * and 1 count on either counter; for the others the even counter counts
+ * accesses and the odd counter misses of the same event number.
+ */
+static const struct mips_perf_event xburst_event_map[PERF_COUNT_HW_MAX] = {
+	[PERF_COUNT_HW_CPU_CYCLES] = { 0x00, CNTR_EVEN | CNTR_ODD, P },
+	[PERF_COUNT_HW_INSTRUCTIONS] = { 0x01, CNTR_EVEN | CNTR_ODD, T },
+	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS] = { 0x02, CNTR_EVEN, T },
+	[PERF_COUNT_HW_BRANCH_MISSES] = { 0x02, CNTR_ODD, T },
+};
+
 static const struct mips_perf_event i6x00_event_map[PERF_COUNT_HW_MAX] = {
 	[PERF_COUNT_HW_CPU_CYCLES]          = { 0x00, CNTR_EVEN | CNTR_ODD },
 	[PERF_COUNT_HW_INSTRUCTIONS]        = { 0x01, CNTR_EVEN | CNTR_ODD },
@@ -1364,6 +1376,40 @@ static const struct mips_perf_event loongson3_cache_map3
 	[C(OP_READ)] = {
 		[C(RESULT_ACCESS)]      = { 0x02, CNTR_ALL },
 		[C(RESULT_MISS)]        = { 0x08, CNTR_ALL },
+	},
+},
+};
+
+static const struct mips_perf_event xburst_cache_map
+				[PERF_COUNT_HW_CACHE_MAX]
+				[PERF_COUNT_HW_CACHE_OP_MAX]
+				[PERF_COUNT_HW_CACHE_RESULT_MAX] = {
+[C(L1D)] = {
+	[C(OP_READ)] = {
+		[C(RESULT_ACCESS)]	= { 0x04, CNTR_EVEN, T },
+		[C(RESULT_MISS)]	= { 0x04, CNTR_ODD, T },
+	},
+	[C(OP_WRITE)] = {
+		[C(RESULT_ACCESS)]	= { 0x05, CNTR_EVEN, T },
+		[C(RESULT_MISS)]	= { 0x05, CNTR_ODD, T },
+	},
+},
+[C(L1I)] = {
+	[C(OP_READ)] = {
+		[C(RESULT_ACCESS)]	= { 0x07, CNTR_EVEN, T },
+		[C(RESULT_MISS)]	= { 0x07, CNTR_ODD, T },
+	},
+},
+[C(DTLB)] = {
+	[C(OP_READ)] = {
+		[C(RESULT_ACCESS)]	= { 0x09, CNTR_EVEN, T },
+		[C(RESULT_MISS)]	= { 0x09, CNTR_ODD, T },
+	},
+},
+[C(ITLB)] = {
+	[C(OP_READ)] = {
+		[C(RESULT_ACCESS)]	= { 0x08, CNTR_EVEN, T },
+		[C(RESULT_MISS)]	= { 0x08, CNTR_ODD, T },
 	},
 },
 };
@@ -1808,6 +1854,13 @@ static const struct mips_perf_event *mipsxx_pmu_map_raw_event(u64 config)
 			raw_event.range = T;
 #endif
 		break;
+	case CPU_XBURST:
+		if (base_id <= 1)
+			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
+		else
+			raw_event.cntr_mask =
+				raw_id > 127 ? CNTR_ODD : CNTR_EVEN;
+		break;
 	case CPU_BMIPS5000:
 		if (IS_BOTH_COUNTERS_BMIPS5000_EVENT(base_id))
 			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
@@ -2004,6 +2057,14 @@ init_hw_perf_events(void)
 		mipspmu.general_event_map = &octeon_event_map;
 		mipspmu.cache_event_map = &octeon_cache_map;
 		mipspmu.map_raw_event = octeon_pmu_map_raw_event;
+		break;
+	case CPU_XBURST:
+		mipspmu.name = "ingenic/xburst";
+		mipspmu.general_event_map = &xburst_event_map;
+		mipspmu.cache_event_map = &xburst_cache_map;
+		if (irq < 0 && cpu_has_mips_r2_r6 && !IS_ENABLED(CONFIG_CEVT_R4K))
+			irq = MIPS_CPU_IRQ_BASE +
+			      ((read_c0_intctl() >> INTCTLB_IPPCI) & 7);
 		break;
 	case CPU_BMIPS5000:
 		mipspmu.name = "BMIPS5000";

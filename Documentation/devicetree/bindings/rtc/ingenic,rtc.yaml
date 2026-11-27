@@ -23,12 +23,24 @@ allOf:
       properties:
         "#clock-cells": false
 
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: ingenic,x2000-rtc
+    then:
+      properties:
+        system-power-controller: false
+        ingenic,reset-pin-assert-time-ms: false
+        ingenic,min-wakeup-pin-assert-time-ms: false
+
 properties:
   compatible:
     oneOf:
       - enum:
           - ingenic,jz4740-rtc
           - ingenic,jz4760-rtc
+          - ingenic,x2000-rtc
       - items:
           - const: ingenic,jz4725b-rtc
           - const: ingenic,jz4740-rtc

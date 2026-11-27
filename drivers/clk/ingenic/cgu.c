@@ -712,8 +712,9 @@ static int ingenic_register_clock(struct ingenic_cgu *cgu, unsigned idx)
 				continue;
 
 			parent = cgu->clocks.clks[clk_info->parents[i]];
-			parent_names[clk_init.num_parents] =
-				__clk_get_name(parent);
+			parent_names[clk_init.num_parents] = parent ?
+				__clk_get_name(parent) :
+				cgu->clock_info[clk_info->parents[i]].name;
 			clk_init.num_parents++;
 		}
 
@@ -723,7 +724,9 @@ static int ingenic_register_clock(struct ingenic_cgu *cgu, unsigned idx)
 		BUG_ON(clk_info->parents[0] == -1);
 		clk_init.num_parents = 1;
 		parent = cgu->clocks.clks[clk_info->parents[0]];
-		parent_names[0] = __clk_get_name(parent);
+		/* Newly appended clock IDs may parent an older ABI clock ID. */
+		parent_names[0] = parent ? __clk_get_name(parent) :
+			cgu->clock_info[clk_info->parents[0]].name;
 	}
 
 	if (caps & CGU_CLK_CUSTOM) {

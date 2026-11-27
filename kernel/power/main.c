@@ -20,6 +20,8 @@
 #include <linux/pm_runtime.h>
 #include <linux/atomic.h>
 #include <linux/wait.h>
+#include <linux/spinlock.h>
+#include <linux/limits.h>
 
 #include "power.h"
 
@@ -95,6 +97,41 @@ void ksys_sync_helper(void)
 EXPORT_SYMBOL_GPL(ksys_sync_helper);
 
 #if defined(CONFIG_SUSPEND) || defined(CONFIG_HIBERNATION)
+/* Monotonic, non-consuming attribution of aborts before freezer/device stats. */
+static DEFINE_RAW_SPINLOCK(pm_sync_abort_lock);
+static u64 pm_sync_abort_count;
+static bool pm_sync_abort_overflow;
+
+static void pm_note_sync_wakeup_abort(void)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&pm_sync_abort_lock, flags);
+	if (pm_sync_abort_count == U64_MAX)
+		pm_sync_abort_overflow = true;
+	else
+		pm_sync_abort_count++;
+	raw_spin_unlock_irqrestore(&pm_sync_abort_lock, flags);
+}
+
+static ssize_t suspend_sync_wakeup_aborts_show(struct kobject *kobj,
+					     struct kobj_attribute *attr,
+					     char *buf)
+{
+	unsigned long flags;
+	u64 count;
+	bool overflow;
+
+	raw_spin_lock_irqsave(&pm_sync_abort_lock, flags);
+	count = pm_sync_abort_count;
+	overflow = pm_sync_abort_overflow;
+	raw_spin_unlock_irqrestore(&pm_sync_abort_lock, flags);
+
+	return sysfs_emit(buf, "version=1 count=%llu overflow=%u\n", count,
+			  overflow);
+}
+power_attr_ro(suspend_sync_wakeup_aborts);
+
 /* Wakeup events handling resolution while syncing file systems in jiffies */
 #define PM_FS_SYNC_WAKEUP_RESOLUTION	5
 
@@ -138,8 +175,10 @@ int pm_sleep_fs_sync(void)
 	}
 
 	while (!pm_fs_sync_completed()) {
-		if (pm_wakeup_pending())
+		if (pm_wakeup_pending()) {
+			pm_note_sync_wakeup_abort();
 			return -EBUSY;
+		}
 
 		wait_event_timeout(pm_fs_sync_wait, pm_fs_sync_completed(),
 				   PM_FS_SYNC_WAKEUP_RESOLUTION);
@@ -869,6 +908,29 @@ static ssize_t wakeup_count_show(struct kobject *kobj,
 		sysfs_emit(buf, "%u\n", val) : -EINTR;
 }
 
+/* Same wakeup counter and store handshake, without blocking input cancellation. */
+static ssize_t wakeup_attribution_show(struct kobject *kobj,
+				      struct kobj_attribute *attr, char *buf)
+{
+	struct pm_wakeup_attribution evidence;
+
+	pm_get_wakeup_attribution(&evidence);
+	return sysfs_emit(buf, "version=1 first=%u second=%u irq_events=%u "
+		"system_events=%u overflow=%u\n", evidence.irq[0], evidence.irq[1],
+		evidence.irq_events, evidence.system_events, evidence.overflow);
+}
+static struct kobj_attribute wakeup_attribution_attr = __ATTR_RO(wakeup_attribution);
+
+static ssize_t wakeup_count_now_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	unsigned int val;
+
+	return pm_get_wakeup_count(&val, false) ?
+		sysfs_emit(buf, "%u\n", val) : -EAGAIN;
+}
+static struct kobj_attribute wakeup_count_now_attr = __ATTR_RO(wakeup_count_now);
+
 static ssize_t wakeup_count_store(struct kobject *kobj,
 				struct kobj_attribute *attr,
 				const char *buf, size_t n)
@@ -1081,6 +1143,8 @@ static struct attribute * g[] = {
 #ifdef CONFIG_PM_SLEEP
 	&pm_async_attr.attr,
 	&wakeup_count_attr.attr,
+	&wakeup_count_now_attr.attr,
+	&wakeup_attribution_attr.attr,
 #ifdef CONFIG_SUSPEND
 	&mem_sleep_attr.attr,
 	&sync_on_suspend_attr.attr,
@@ -1103,6 +1167,7 @@ static struct attribute * g[] = {
 	&pm_freeze_timeout_attr.attr,
 #endif
 #if defined(CONFIG_SUSPEND) || defined(CONFIG_HIBERNATION)
+	&suspend_sync_wakeup_aborts_attr.attr,
 	&freeze_filesystems_attr.attr,
 #endif
 	NULL,

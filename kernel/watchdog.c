@@ -47,7 +47,17 @@ unsigned long __read_mostly watchdog_enabled;
 int __read_mostly watchdog_user_enabled = 1;
 static int __read_mostly watchdog_hardlockup_user_enabled = WATCHDOG_HARDLOCKUP_DEFAULT;
 static int __read_mostly watchdog_softlockup_user_enabled = 1;
-int __read_mostly watchdog_thresh = 10;
+/*
+ * Q2 diagnostic kernel: 1 s (upstream 10). The soft lockup threshold is
+ * 2 * watchdog_thresh; get_timestamp() counts in 2^30 ns units, so a soft
+ * lockup is reported after about 2.1-3.2 s. The buddy hard lockup check
+ * runs every 2 * watchdog_thresh / NUM_SAMPLE_PERIODS (0.4 s) and reports
+ * after three misses in a row (about 1.2-1.6 s). Both report before the
+ * X2000 hardware watchdog (5 s) resets the SoC. Each online CPU takes the
+ * watchdog hrtimer and the softlockup stopper work every 0.4 s.
+ * The watchdog_thresh= boot parameter and sysctl still change it.
+ */
+int __read_mostly watchdog_thresh = 1;
 static int __read_mostly watchdog_thresh_next;
 static int __read_mostly watchdog_hardlockup_available;
 

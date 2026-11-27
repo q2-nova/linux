@@ -72,6 +72,20 @@ static inline void __iomem *get_gic(const struct vdso_time_data *data)
 
 #endif /* CONFIG_CLKSRC_MIPS_GIC */
 
+#ifdef CONFIG_INGENIC_X2000_OST
+
+/*
+ * The X2000 global OST page, mapped read-only and uncached in place of the
+ * GIC user page (drivers/clocksource/ingenic-x2000-ost.c). Its registers
+ * start at the page: the driver offers the page only then.
+ */
+static inline void __iomem *get_x2000_ost(const struct vdso_time_data *data)
+{
+	return (void __iomem *)((unsigned long)data & PAGE_MASK) - PAGE_SIZE;
+}
+
+#endif /* CONFIG_INGENIC_X2000_OST */
+
 #endif /* __ASSEMBLER__ */
 
 #endif /* __ASM_VDSO_VDSO_H */

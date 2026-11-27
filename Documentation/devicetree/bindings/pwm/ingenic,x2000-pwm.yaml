@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pwm/ingenic,x2000-pwm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Ingenic X2000 standalone PWM controller
+
+maintainers:
+  - linux-mips@vger.kernel.org
+
+description: |
+  Sixteen PWM channels with individual power-of-two prescalers and 16-bit
+  high/low counters. This block is separate from the older Ingenic TCU.
+
+allOf:
+  - $ref: pwm.yaml#
+
+properties:
+  compatible:
+    const: ingenic,x2000-pwm
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  "#pwm-cells":
+    const: 3
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - "#pwm-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    pwm@134c0000 {
+        compatible = "ingenic,x2000-pwm";
+        reg = <0x134c0000 0x400>;
+        clocks = <&pwm_clk>;
+        #pwm-cells = <3>;
+    };

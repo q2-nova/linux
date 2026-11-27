@@ -6,6 +6,8 @@
  */
 
 #include <linux/syscore_ops.h>
+#include <linux/q2-pm-checkpoint.h>
+#include <linux/q2-pm-checkpoint-record.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/suspend.h>
@@ -62,7 +64,9 @@ int syscore_suspend(void)
 	list_for_each_entry_reverse(syscore, &syscore_list, node)
 		if (syscore->ops->suspend) {
 			pm_pr_dbg("Calling %pS\n", syscore->ops->suspend);
+			q2_pm_checkpoint(Q2_CP_SYSCORE_SUSPEND_CALL,(unsigned long)syscore->ops->suspend);
 			ret = syscore->ops->suspend(syscore->data);
+			q2_pm_checkpoint(Q2_CP_SYSCORE_SUSPEND_RETURN,(unsigned long)syscore->ops->suspend);
 			if (ret)
 				goto err_out;
 			WARN_ONCE(!irqs_disabled(),
@@ -78,8 +82,11 @@ int syscore_suspend(void)
 	       syscore->ops->suspend);
 
 	list_for_each_entry_continue(syscore, &syscore_list, node)
-		if (syscore->ops->resume)
+		if (syscore->ops->resume) {
+			q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_CALL,(unsigned long)syscore->ops->resume);
 			syscore->ops->resume(syscore->data);
+			q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_RETURN,(unsigned long)syscore->ops->resume);
+		}
 
 	return ret;
 }
@@ -98,15 +105,25 @@ void syscore_resume(void)
 	WARN_ONCE(!irqs_disabled(),
 		"Interrupts enabled before system core resume.\n");
 
-	list_for_each_entry(syscore, &syscore_list, node)
+	list_for_each_entry(syscore, &syscore_list, node) {
+		q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_NODE_REACHED,0);
+		q2_pm_mmu_probe((unsigned long)syscore,(unsigned long)syscore->ops);
 		if (syscore->ops->resume) {
 			pm_pr_dbg("Calling %pS\n", syscore->ops->resume);
+			q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_CALL,(unsigned long)syscore->ops->resume);
 			syscore->ops->resume(syscore->data);
+			q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_RETURN,(unsigned long)syscore->ops->resume);
+			q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_IRQ_CHECK,0);
 			WARN_ONCE(!irqs_disabled(),
 				"Interrupts enabled after %pS\n",
 				syscore->ops->resume);
+			q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_IRQ_CHECKED,0);
 		}
+		q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_NODE_DONE,0);
+	}
+	q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_TRACE_ENTER,0);
 	trace_suspend_resume(TPS("syscore_resume"), 0, false);
+	q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME_TRACE_DONE,0);
 }
 EXPORT_SYMBOL_GPL(syscore_resume);
 #endif /* CONFIG_PM_SLEEP */

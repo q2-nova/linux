@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/shanling,q2-wheel.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Shanling Q2 CST816T wheel firmware
+
+maintainers:
+  - linux-mips@vger.kernel.org
+
+description: |
+  The Q2 uses custom CST816T firmware with an absolute ring position at
+  register 0x21 (1 through 200, zero means released). This is not the generic
+  CST816T touchscreen coordinate protocol. PB20 resets the controller and
+  PB21 signals a new report with a falling edge.
+
+properties:
+  compatible:
+    const: shanling,q2-wheel
+  reg:
+    maxItems: 1
+  interrupts:
+    maxItems: 1
+  reset-gpios:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - reset-gpios
+
+additionalProperties: false

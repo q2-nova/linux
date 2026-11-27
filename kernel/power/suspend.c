@@ -10,6 +10,13 @@
 #define pr_fmt(fmt) "PM: " fmt
 
 #include <linux/string.h>
+#include <linux/q2-pm-checkpoint.h>
+#include <linux/q2-pm-checkpoint-record.h>
+
+void __weak q2_pm_checkpoint(unsigned int phase, unsigned long callback) {}
+void __weak q2_pm_mmu_probe(unsigned long node,unsigned long ops) {}
+void __weak q2_pm_mmu_fault(const struct pt_regs *regs,unsigned long address,unsigned int kind) {}
+void __weak q2_pm_mmu_fault_origin(const struct pt_regs *regs,unsigned long address,unsigned int kind,unsigned int origin) {}
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/init.h>
@@ -420,24 +427,29 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 {
 	int error;
 
+	q2_pm_checkpoint(Q2_CP_PLATFORM_PREPARE,0);
 	error = platform_suspend_prepare(state);
 	if (error)
 		goto Platform_finish;
 
+	q2_pm_checkpoint(Q2_CP_DEVICE_LATE,0);
 	error = dpm_suspend_late(PMSG_SUSPEND);
 	if (error) {
 		pr_err("late suspend of devices failed\n");
 		goto Platform_finish;
 	}
+	q2_pm_checkpoint(Q2_CP_DEVICE_LATE_DONE,0);
 	error = platform_suspend_prepare_late(state);
 	if (error)
 		goto Devices_early_resume;
 
+	q2_pm_checkpoint(Q2_CP_DEVICE_NOIRQ,0);
 	error = dpm_suspend_noirq(PMSG_SUSPEND);
 	if (error) {
 		pr_err("noirq suspend of devices failed\n");
 		goto Platform_early_resume;
 	}
+	q2_pm_checkpoint(Q2_CP_DEVICE_NOIRQ_DONE,0);
 	error = platform_suspend_prepare_noirq(state);
 	if (error)
 		goto Platform_wake;
@@ -450,49 +462,67 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 		goto Platform_wake;
 	}
 
+	q2_pm_checkpoint(Q2_CP_CPU_DISABLE,0);
 	error = pm_sleep_disable_secondary_cpus();
+	q2_pm_checkpoint(Q2_CP_CPU_DISABLED,0);
 	if (error || suspend_test(TEST_CPUS))
 		goto Enable_cpus;
 
+	q2_pm_checkpoint(Q2_CP_IRQ_DISABLE,0);
 	arch_suspend_disable_irqs();
 	BUG_ON(!irqs_disabled());
 
 	system_state = SYSTEM_SUSPEND;
 
+	q2_pm_checkpoint(Q2_CP_SYSCORE_SUSPEND,0);
 	error = syscore_suspend();
 	if (!error) {
+		q2_pm_checkpoint(Q2_CP_SYSCORE_SUSPENDED,0);
 		*wakeup = pm_wakeup_pending();
+		q2_pm_checkpoint(Q2_CP_CORE_DELAY,0);
 		if (!(suspend_test(TEST_CORE) || *wakeup)) {
 			trace_suspend_resume(TPS("machine_suspend"),
 				state, true);
+			q2_pm_checkpoint(Q2_CP_PLATFORM_ENTER,0);
 			error = suspend_ops->enter(state);
+			q2_pm_checkpoint(Q2_CP_PLATFORM_RETURNED,0);
 			trace_suspend_resume(TPS("machine_suspend"),
 				state, false);
 		} else if (*wakeup) {
 			error = -EBUSY;
 		}
+		q2_pm_checkpoint(Q2_CP_SYSCORE_RESUME,0);
 		syscore_resume();
+		q2_pm_checkpoint(Q2_CP_SYSCORE_RESUMED,0);
 	}
 
 	system_state = SYSTEM_RUNNING;
 
+	q2_pm_checkpoint(Q2_CP_IRQ_ENABLE,0);
 	arch_suspend_enable_irqs();
 	BUG_ON(irqs_disabled());
 
  Enable_cpus:
+	q2_pm_checkpoint(Q2_CP_CPU_ENABLE,0);
 	pm_sleep_enable_secondary_cpus();
+	q2_pm_checkpoint(Q2_CP_CPU_ENABLED,0);
 
  Platform_wake:
+	q2_pm_checkpoint(Q2_CP_PLATFORM_WAKE,0);
 	platform_resume_noirq(state);
+	q2_pm_checkpoint(Q2_CP_DEVICE_NOIRQ_RESUME,0);
 	dpm_resume_noirq(PMSG_RESUME);
 
  Platform_early_resume:
+	q2_pm_checkpoint(Q2_CP_PLATFORM_EARLY,0);
 	platform_resume_early(state);
 
  Devices_early_resume:
+	q2_pm_checkpoint(Q2_CP_DEVICE_EARLY_RESUME,0);
 	dpm_resume_early(PMSG_RESUME);
 
  Platform_finish:
+	q2_pm_checkpoint(Q2_CP_PLATFORM_FINISH,0);
 	platform_resume_finish(state);
 	return error;
 }
@@ -518,13 +548,16 @@ int suspend_devices_and_enter(suspend_state_t state)
 	if (error)
 		goto Close;
 
+	q2_pm_checkpoint(Q2_CP_CONSOLE_SUSPEND,0);
 	console_suspend_all();
 	suspend_test_start();
+	q2_pm_checkpoint(Q2_CP_DEVICE_SUSPEND,0);
 	error = dpm_suspend_start(PMSG_SUSPEND);
 	if (error) {
 		pr_err("Some devices failed to suspend, or early wake event detected\n");
 		goto Recover_platform;
 	}
+	q2_pm_checkpoint(Q2_CP_DEVICE_SUSPENDED,0);
 	suspend_test_finish("suspend devices");
 	if (suspend_test(TEST_DEVICES))
 		goto Recover_platform;
@@ -535,13 +568,17 @@ int suspend_devices_and_enter(suspend_state_t state)
 
  Resume_devices:
 	suspend_test_start();
+	q2_pm_checkpoint(Q2_CP_DEVICE_RESUME,0);
 	dpm_resume_end(PMSG_RESUME);
+	q2_pm_checkpoint(Q2_CP_DEVICE_RESUMED,0);
 	suspend_test_finish("resume devices");
 	trace_suspend_resume(TPS("console_resume_all"), state, true);
+	q2_pm_checkpoint(Q2_CP_CONSOLE_RESUME,0);
 	console_resume_all();
 	trace_suspend_resume(TPS("console_resume_all"), state, false);
 
  Close:
+	q2_pm_checkpoint(Q2_CP_PLATFORM_END,0);
 	platform_resume_end(state);
 	pm_suspend_target_state = PM_SUSPEND_ON;
 	return error;

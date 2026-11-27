@@ -65,6 +65,18 @@ static blk_status_t do_blktrans_request(struct mtd_blktrans_ops *tr,
 		return BLK_STS_OK;
 	case REQ_OP_READ:
 		buf = kmap(bio_page(req->bio)) + bio_offset(req->bio);
+		if (tr->readsects) {
+			int ret = tr->readsects(dev, block, nsect, buf);
+
+			if (ret != -EOPNOTSUPP) {
+				kunmap(bio_page(req->bio));
+				if (ret)
+					return BLK_STS_IOERR;
+				/* Only the current segment was written. */
+				flush_dcache_page(bio_page(req->bio));
+				return BLK_STS_OK;
+			}
+		}
 		for (; nsect > 0; nsect--, block++, buf += tr->blksize) {
 			if (tr->readsect(dev, block, buf)) {
 				kunmap(bio_page(req->bio));

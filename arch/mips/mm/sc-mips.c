@@ -218,6 +218,14 @@ static inline int mips_sc_probe(void)
 	tmp = (config2 >> 0) & 0x0f;
 	if (tmp <= 7)
 		c->scache.ways = tmp + 1;
+	/*
+	 * X2000 (XBurst2) reports SA=15 for its 16-way L2: Config2 0x8000235f
+	 * read on a Shanling Q2, 512 sets x 64 B x 16 = 512 KiB, the size the
+	 * Ingenic SDK flushes.
+	 */
+	else if (tmp == 15 && current_cpu_type() == CPU_XBURST &&
+		 (c->processor_id & PRID_IMP_MASK) == PRID_IMP_XBURST2)
+		c->scache.ways = 16;
 	else
 		return 0;
 

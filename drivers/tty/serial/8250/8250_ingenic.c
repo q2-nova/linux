@@ -24,6 +24,7 @@
 struct ingenic_uart_config {
 	int tx_loadsz;
 	int fifosize;
+	bool umr;	/* program UMR (clocks per bit) for rates above uartclk / 16 */
 };
 
 struct ingenic_uart_data {
@@ -38,6 +39,30 @@ static const struct of_device_id of_match[];
 
 #define UART_MCR_MDCE	BIT(7)
 #define UART_MCR_FCM	BIT(6)
+
+/*
+ * UMR holds M, the UART clock cycles per bit (16 as in a 16550): the rate is
+ * uartclk / (M * divisor). UACR's 12 bits add a cycle to selected bits of a
+ * frame for fractional rates; this driver keeps it 0. Byte offsets.
+ */
+#define INGENIC_UART_UMR	0x24
+#define INGENIC_UART_UACR	0x28
+#define INGENIC_UART_M_STD	16
+#define INGENIC_UART_M_MIN	6
+
+/*
+ * The order of the baud-rate register writes, for the device test:
+ * 0, the default: the stock Q2 kernel's (serial_ingenic_set_termios() in
+ *    Shanling's V1.32 firmware): LCR with DLAB, DLL, DLM, LCR without DLAB,
+ *    then UMR and UACR, with the UART enabled;
+ * 1: the same, with the UART disabled (FCR.UME clear) from before the
+ *    divisor until serial8250_set_fcr() writes FCR again, as in the X1000
+ *    manual's configuration sequence (23.8.1); only when M changes;
+ * 2: patch 0191's: UMR and UACR while DLAB is still set.
+ */
+static unsigned int umr_seq;
+module_param(umr_seq, uint, 0644);
+MODULE_PARM_DESC(umr_seq, "UMR write order: 0 stock (after DLAB clears), 1 stock with UME clear, 2 with DLAB set");
 
 static struct earlycon_device *early_device;
 
@@ -228,6 +253,126 @@ static u32 ingenic_uart_serial_in(struct uart_port *p, unsigned int offset)
 	return value;
 }
 
+static unsigned int ingenic_uart_error(unsigned int clk, unsigned int baud,
+				       unsigned int m, unsigned int d)
+{
+	unsigned int rate = DIV_ROUND_CLOSEST(clk, m * d);
+
+	return rate > baud ? rate - baud : baud - rate;
+}
+
+static bool ingenic_uart_within(unsigned int error, unsigned int baud,
+				unsigned int percent)
+{
+	return (u64)error * 100 <= (u64)baud * percent;
+}
+
+/*
+ * The divisor and M with the smallest error for @baud, M from 16 down to
+ * INGENIC_UART_M_MIN; a tie keeps the larger M. False above 3 %.
+ */
+static bool ingenic_uart_search(unsigned int clk, unsigned int baud,
+				unsigned int *quot, unsigned int *m)
+{
+	unsigned int best = UINT_MAX, i, d, error;
+
+	*quot = 0;
+	for (i = INGENIC_UART_M_STD; i >= INGENIC_UART_M_MIN; i--) {
+		/* The two divisors around the exact one. */
+		for (d = clk / (i * baud); d <= clk / (i * baud) + 1; d++) {
+			if (d < 1 || d > UART_DIV_MAX)
+				continue;
+			error = ingenic_uart_error(clk, baud, i, d);
+			if (error < best) {
+				best = error;
+				*quot = d;
+				*m = i;
+			}
+		}
+	}
+	return *quot && ingenic_uart_within(best, baud, 3);
+}
+
+/*
+ * Rates the 16x divisor reaches within 2 % keep M = 16, so they are
+ * programmed as before UMR was used; so does the old custom divisor
+ * (spd_cust). Other rates take the search's divisor and M. With neither,
+ * the 16x divisor, at least 1. M is returned in @frac.
+ */
+static unsigned int ingenic_uart_get_divisor(struct uart_port *port,
+					     unsigned int baud,
+					     unsigned int *frac)
+{
+	unsigned int quot = uart_get_divisor(port, baud), d, m;
+
+	*frac = INGENIC_UART_M_STD;
+	if (!baud || (baud == 38400 && (port->flags & UPF_SPD_MASK) == UPF_SPD_CUST))
+		return quot;
+	if (quot && ingenic_uart_within(ingenic_uart_error(port->uartclk, baud,
+				INGENIC_UART_M_STD, quot), baud, 2))
+		return quot;
+	if (ingenic_uart_search(port->uartclk, baud, &d, &m)) {
+		*frac = m;
+		return d;
+	}
+	return max(quot, 1U);
+}
+
+/*
+ * serial8250_do_set_divisor() writes LCR with DLAB and the divisor. As the
+ * stock kernel does, LCR is then written without DLAB and UMR and UACR
+ * after it (umr_seq 0); serial8250_set_fcr() then writes LCR and FCR as
+ * before. UMR and UACR are 32-bit writes, as in stock. A rate with M other
+ * than 16, or a register that does not read back as written, is logged
+ * with the values read back (deferred: the port lock is held, and this may
+ * be the console).
+ */
+static void ingenic_uart_set_divisor(struct uart_port *port, unsigned int baud,
+				     unsigned int quot, unsigned int m)
+{
+	struct uart_8250_port *up = up_to_u8250p(port);
+	unsigned int seq = READ_ONCE(umr_seq), umr, uacr;
+
+	if (m < INGENIC_UART_M_MIN || m > INGENIC_UART_M_STD)
+		m = INGENIC_UART_M_STD;
+	if (seq > 2)
+		seq = 0;
+
+	/* Written directly: ingenic_uart_serial_out() would set UME. */
+	if (seq == 1 && (readl(port->membase + INGENIC_UART_UMR) & 0x1f) != m)
+		writeb(up->fcr, port->membase + (UART_FCR << port->regshift));
+	serial8250_do_set_divisor(port, baud, quot);
+	if (seq != 2)
+		serial_port_out(port, UART_LCR, up->lcr);
+	writel(m, port->membase + INGENIC_UART_UMR);
+	writel(0, port->membase + INGENIC_UART_UACR);
+
+	umr = readl(port->membase + INGENIC_UART_UMR) & 0x1f;
+	uacr = readl(port->membase + INGENIC_UART_UACR) & 0xfff;
+	if (m != INGENIC_UART_M_STD || umr != m || uacr)
+		printk_deferred(KERN_INFO "ttyS%u: %u baud: divisor %u, UMR %u (reads %u), UACR 0 (reads %#x), umr_seq %u\n",
+				port->line, baud, quot, m, umr, uacr, seq);
+}
+
+/*
+ * UPF_MAGIC_MULTIPLIER makes the core accept up to uartclk / 4 (and down to
+ * half its usual minimum). Keep that only for rates above the 16x ceiling
+ * that UMR reaches within 3 %; every other rate goes through the 16x
+ * limits first, so it is clipped exactly as without the flag.
+ */
+static void ingenic_uart_set_termios(struct uart_port *port,
+				     struct ktermios *termios,
+				     const struct ktermios *old)
+{
+	unsigned int clk = port->uartclk, baud = tty_termios_baud_rate(termios);
+	unsigned int ceiling = (clk + clk / 100) / 16, quot, m;
+
+	if (!(baud > ceiling && ingenic_uart_search(clk, baud, &quot, &m)))
+		uart_get_baud_rate(port, termios, old, clk / 16 / UART_DIV_MAX, ceiling);
+
+	serial8250_do_set_termios(port, termios, old);
+}
+
 static int ingenic_uart_probe(struct platform_device *pdev)
 {
 	struct uart_8250_port uart = {};
@@ -261,6 +406,12 @@ static int ingenic_uart_probe(struct platform_device *pdev)
 	uart.port.dev = &pdev->dev;
 	uart.tx_loadsz = cdata->tx_loadsz;
 	uart.capabilities = UART_CAP_FIFO | UART_CAP_RTOIE;
+	if (cdata->umr) {
+		uart.port.flags |= UPF_MAGIC_MULTIPLIER;
+		uart.port.set_termios = ingenic_uart_set_termios;
+		uart.port.get_divisor = ingenic_uart_get_divisor;
+		uart.port.set_divisor = ingenic_uart_set_divisor;
+	}
 
 	err = uart_read_port_properties(&uart.port);
 	if (err)
@@ -343,6 +494,12 @@ static const struct ingenic_uart_config x1000_uart_config = {
 	.fifosize = 64,
 };
 
+static const struct ingenic_uart_config x2000_uart_config = {
+	.tx_loadsz = 32,
+	.fifosize = 64,
+	.umr = true,
+};
+
 static const struct of_device_id of_match[] = {
 	{ .compatible = "ingenic,jz4740-uart", .data = &jz4740_uart_config },
 	{ .compatible = "ingenic,jz4750-uart", .data = &jz4760_uart_config },
@@ -351,6 +508,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "ingenic,jz4775-uart", .data = &jz4760_uart_config },
 	{ .compatible = "ingenic,jz4780-uart", .data = &jz4780_uart_config },
 	{ .compatible = "ingenic,x1000-uart", .data = &x1000_uart_config },
+	{ .compatible = "ingenic,x2000-uart", .data = &x2000_uart_config },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, of_match);

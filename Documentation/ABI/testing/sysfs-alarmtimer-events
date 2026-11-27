@@ -1,0 +1,12 @@
+What: /sys/bus/platform/devices/alarmtimer.*/alarm_events
+Date: November 2026
+Contact: Q2 Navidrome developers
+Description:
+ Read-only version1 joint snapshot of REALTIME/BOOTTIME alarm expiry counts,
+ pending-due flags, overflow and guarded (wakeup-count event guard available).
+ The fixed REALTIME then BOOTTIME lock order makes the snapshot joint. Counts
+ advance before fd callbacks, and each expiry emits a zero-duration wake event
+ so a late user alarm races the final wakeup_count handshake rather than being
+ silently re-slept. Counters saturate; unknown/overflow/unguarded evidence must
+ not be called maintenance-only. Timer identities/deadlines/data are not exposed.
+ Existing RTC timerqueue ordering and user alarm programming are unchanged.

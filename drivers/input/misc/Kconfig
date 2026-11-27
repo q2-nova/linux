@@ -13,6 +13,23 @@ menuconfig INPUT_MISC
 
 if INPUT_MISC
 
+config INPUT_SHANLING_Q2_WHEEL
+	tristate "Shanling Q2 capacitive wheel"
+	depends on I2C && GPIOLIB
+	help
+	  Input support for the CST816T with Q2 wheel firmware. Reports
+	  absolute ring position, pressure and touch state through evdev.
+	  This driver uses the application protocol only and does not
+	  update controller firmware. Module name: shanling-q2-wheel.
+
+config INPUT_SHANLING_Q2_TOUCHSCREEN
+	tristate "Shanling Q2 touchscreen"
+	depends on I2C && GPIOLIB && REGULATOR
+	help
+	  Input support for the Q2 display panel's CST8xxT controller.
+	  Scans only while the input device is open and the system is
+	  awake. Module name: shanling-q2-touchscreen.
+
 config INPUT_88PM860X_ONKEY
 	tristate "88PM860x ONKEY support"
 	depends on MFD_88PM860X

@@ -31,6 +31,7 @@
 #define AXP20X_PWR_STATUS_VBUS_USED	BIT(4)
 
 #define AXP717_PWR_STATUS_VBUS_GOOD	BIT(5)
+#define AXP2101_PWR_STATUS_VBUS_GOOD	BIT(5)
 
 #define AXP20X_USB_STATUS_VBUS_VALID	BIT(2)
 
@@ -172,6 +173,28 @@ static void axp717_usb_power_poll_vbus(struct work_struct *work)
 	power->old_status = val;
 }
 
+static void axp2101_usb_power_poll_vbus(struct work_struct *work)
+{
+	struct axp20x_usb_power *power =
+		container_of(work, struct axp20x_usb_power, vbus_detect.work);
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(power->regmap, AXP2101_PMU_STATUS_1, &val);
+	if (ret)
+		goto out;
+
+	val &= AXP2101_PWR_STATUS_VBUS_GOOD;
+	if (val != power->old_status)
+		power_supply_changed(power->supply);
+
+	power->old_status = val;
+out:
+	if (!power->num_irqs)
+		mod_delayed_work(system_power_efficient_wq, &power->vbus_detect,
+				 msecs_to_jiffies(2000));
+}
+
 static int axp20x_get_usb_type(struct axp20x_usb_power *power,
 			       union power_supply_propval *val)
 {
@@ -307,6 +330,42 @@ static int axp20x_usb_power_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_ONLINE:
 		val->intval = !!(input & AXP20X_PWR_STATUS_VBUS_USED);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* Input current limits of AXP2101_IIN_LIM; 6 and 7 are reserved. */
+static const int axp2101_usb_curr_lim_table[] = {
+	100000, 500000, 900000, 1000000, 1500000, 2000000,
+};
+
+static int axp2101_usb_power_get_property(struct power_supply *psy,
+					  enum power_supply_property psp,
+					  union power_supply_propval *val)
+{
+	struct axp20x_usb_power *power = power_supply_get_drvdata(psy);
+	unsigned int v;
+	int ret;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		ret = regmap_field_read(power->curr_lim_fld, &v);
+		if (ret)
+			return ret;
+		if (v >= ARRAY_SIZE(axp2101_usb_curr_lim_table))
+			return -EINVAL;
+		val->intval = axp2101_usb_curr_lim_table[v];
+		break;
+	case POWER_SUPPLY_PROP_ONLINE:
+	case POWER_SUPPLY_PROP_PRESENT:
+		ret = regmap_read(power->regmap, AXP2101_PMU_STATUS_1, &v);
+		if (ret)
+			return ret;
+		val->intval = !!(v & AXP2101_PWR_STATUS_VBUS_GOOD);
 		break;
 	default:
 		return -EINVAL;
@@ -643,6 +702,12 @@ static enum power_supply_property axp22x_usb_power_properties[] = {
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 };
 
+static enum power_supply_property axp2101_usb_power_properties[] = {
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_PRESENT,
+};
+
 static enum power_supply_property axp717_usb_power_properties[] = {
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
@@ -682,6 +747,14 @@ static const struct power_supply_desc axp22x_usb_power_desc = {
 	.set_property = axp20x_usb_power_set_property,
 };
 
+static const struct power_supply_desc axp2101_usb_power_desc = {
+	.name = "axp20x-usb",
+	.type = POWER_SUPPLY_TYPE_USB,
+	.properties = axp2101_usb_power_properties,
+	.num_properties = ARRAY_SIZE(axp2101_usb_power_properties),
+	.get_property = axp2101_usb_power_get_property,
+};
+
 static const struct power_supply_desc axp717_usb_power_desc = {
 	.name = "axp20x-usb",
 	.type = POWER_SUPPLY_TYPE_USB,
@@ -718,6 +791,11 @@ static const char * const axp20x_irq_names[] = {
 };
 
 static const char * const axp22x_irq_names[] = {
+	"VBUS_PLUGIN",
+	"VBUS_REMOVAL",
+};
+
+static const char * const axp2101_irq_names[] = {
 	"VBUS_PLUGIN",
 	"VBUS_REMOVAL",
 };
@@ -815,6 +893,15 @@ static const struct axp_data axp223_data = {
 	.axp20x_cfg_adc_reg = axp20x_configure_adc_registers,
 };
 
+static const struct axp_data axp2101_data = {
+	.power_desc	= &axp2101_usb_power_desc,
+	.irq_names	= axp2101_irq_names,
+	.num_irq_names	= ARRAY_SIZE(axp2101_irq_names),
+	.curr_lim_fld	= REG_FIELD(AXP2101_IIN_LIM, 0, 2),
+	.vbus_needs_polling = false,
+	.axp20x_read_vbus = &axp2101_usb_power_poll_vbus,
+};
+
 static const struct axp_data axp717_data = {
 	.power_desc     = &axp717_usb_power_desc,
 	.irq_names      = axp717_irq_names,
@@ -851,13 +938,15 @@ static int axp20x_usb_power_suspend(struct device *dev)
 	struct axp20x_usb_power *power = dev_get_drvdata(dev);
 	int i = 0;
 
+	cancel_delayed_work_sync(&power->vbus_detect);
+
 	/*
 	 * Allow wake via VBUS_PLUGIN only.
 	 *
 	 * As nested threaded IRQs are not automatically disabled during
 	 * suspend, we must explicitly disable the remainder of the IRQs.
 	 */
-	if (device_may_wakeup(&power->supply->dev))
+	if (power->num_irqs && device_may_wakeup(&power->supply->dev))
 		enable_irq_wake(power->irqs[i++]);
 	while (i < power->num_irqs)
 		disable_irq(power->irqs[i++]);
@@ -870,7 +959,7 @@ static int axp20x_usb_power_resume(struct device *dev)
 	struct axp20x_usb_power *power = dev_get_drvdata(dev);
 	int i = 0;
 
-	if (device_may_wakeup(&power->supply->dev))
+	if (power->num_irqs && device_may_wakeup(&power->supply->dev))
 		disable_irq_wake(power->irqs[i++]);
 	while (i < power->num_irqs)
 		enable_irq(power->irqs[i++]);
@@ -946,12 +1035,18 @@ static int axp20x_usb_power_probe(struct platform_device *pdev)
 	power->axp_data = axp_data;
 	power->regmap = axp20x->regmap;
 	power->num_irqs = axp_data->num_irq_names;
+	if (axp20x->variant == AXP2101_ID && !axp20x->regmap_irqc)
+		power->num_irqs = 0;
 
 	power->curr_lim_fld = devm_regmap_field_alloc(&pdev->dev, power->regmap,
 						      axp_data->curr_lim_fld);
 	if (IS_ERR(power->curr_lim_fld))
 		return PTR_ERR(power->curr_lim_fld);
 
+	if (axp20x->variant == AXP2101_ID &&
+	    device_property_present(&pdev->dev, "input-current-limit-microamp"))
+		return dev_err_probe(&pdev->dev, -EOPNOTSUPP,
+				     "AXP2101 input current limit writes unsupported\n");
 	axp20x_usb_power_parse_dt(&pdev->dev, power);
 
 	ret = axp20x_regmap_field_alloc_optional(&pdev->dev, power->regmap,
@@ -1021,7 +1116,7 @@ static int axp20x_usb_power_probe(struct platform_device *pdev)
 		return PTR_ERR(power->supply);
 
 	/* Request irqs after registering, as irqs may trigger immediately */
-	for (i = 0; i < axp_data->num_irq_names; i++) {
+	for (i = 0; i < power->num_irqs; i++) {
 		irq = platform_get_irq_byname(pdev, axp_data->irq_names[i]);
 		if (irq < 0)
 			return irq;
@@ -1034,7 +1129,7 @@ static int axp20x_usb_power_probe(struct platform_device *pdev)
 			return ret;
 	}
 
-	if (axp20x_usb_vbus_needs_polling(power))
+	if (!power->num_irqs || axp20x_usb_vbus_needs_polling(power))
 		queue_delayed_work(system_power_efficient_wq, &power->vbus_detect, 0);
 
 	return 0;
@@ -1056,6 +1151,9 @@ static const struct of_device_id axp20x_usb_power_match[] = {
 	}, {
 		.compatible = "x-powers,axp717-usb-power-supply",
 		.data = &axp717_data,
+	}, {
+		.compatible = "x-powers,axp2101-usb-power-supply",
+		.data = &axp2101_data,
 	}, {
 		.compatible = "x-powers,axp813-usb-power-supply",
 		.data = &axp813_data,

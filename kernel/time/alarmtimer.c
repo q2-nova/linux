@@ -21,6 +21,8 @@
 #include <linux/alarmtimer.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
+#include <linux/sysfs.h>
 #include <linux/posix-timers.h>
 #include <linux/workqueue.h>
 #include <linux/freezer.h>
@@ -47,7 +49,30 @@ static struct alarm_base {
 	ktime_t			(*get_ktime)(void);
 	void			(*get_timespec)(struct timespec64 *tp);
 	clockid_t		base_clockid;
+	u64			expired_events;
+	u64			last_expiry_boottime_ns;
+	bool			event_overflow;
 } alarm_bases[ALARM_NUMTYPE];
+
+/* Numeric, non-consuming attribution for retained maintenance sleep. */
+static struct wakeup_source *alarm_events_wakeup;
+
+static void alarmtimer_note_expiry_locked(struct alarm_base *base)
+{
+	lockdep_assert_held(&base->lock);
+	base->last_expiry_boottime_ns = ktime_get_boottime_ns();
+	if (base->expired_events == U64_MAX)
+		base->event_overflow = true;
+	else
+		base->expired_events++;
+	if (base->expired_events == U64_MAX)
+		base->event_overflow = true;
+	/* Close the userspace attribution-check/wakeup_count handshake race.
+	 * No timeout hold: the event is counted before its fd callback is ready. */
+	if (alarm_events_wakeup)
+		__pm_wakeup_event(alarm_events_wakeup, 0);
+}
+
 
 #if defined(CONFIG_POSIX_TIMERS) || defined(CONFIG_RTC_CLASS)
 /* freezer information to handle clock_nanosleep triggered wakeups */
@@ -188,8 +213,10 @@ static enum hrtimer_restart alarmtimer_fired(struct hrtimer *timer)
 	struct alarm *alarm = container_of(timer, struct alarm, timer);
 	struct alarm_base *base = &alarm_bases[alarm->type];
 
-	scoped_guard(spinlock_irqsave, &base->lock)
+	scoped_guard(spinlock_irqsave, &base->lock) {
+		alarmtimer_note_expiry_locked(base);
 		alarmtimer_dequeue(base, alarm);
+	}
 
 	if (alarm->function)
 		alarm->function(alarm, base->get_ktime());
@@ -825,6 +852,47 @@ const struct k_clock alarm_clock = {
 #endif /* CONFIG_POSIX_TIMERS */
 
 
+static ssize_t alarm_events_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct alarm_base *real = &alarm_bases[ALARM_REALTIME];
+	struct alarm_base *boot = &alarm_bases[ALARM_BOOTTIME];
+	struct timerqueue_node *next;
+	unsigned long flags;
+	u64 real_events, boot_events, real_last, boot_last;
+	bool real_due, boot_due, overflow;
+
+	BUILD_BUG_ON(ALARM_NUMTYPE != 2);
+	/* Fixed REALTIME -> BOOTTIME order; callbacks hold only their one base.
+	 * A joint snapshot must not miss a coincident expiry between bases. */
+	spin_lock_irqsave(&real->lock, flags);
+	spin_lock_nested(&boot->lock, SINGLE_DEPTH_NESTING);
+	real_events = real->expired_events;
+	boot_events = boot->expired_events;
+	real_last = real->last_expiry_boottime_ns;
+	boot_last = boot->last_expiry_boottime_ns;
+	overflow = real->event_overflow || boot->event_overflow;
+	next = timerqueue_getnext(&real->timerqueue);
+	real_due = next && !ktime_after(next->expires, real->get_ktime());
+	next = timerqueue_getnext(&boot->timerqueue);
+	boot_due = next && !ktime_after(next->expires, boot->get_ktime());
+	spin_unlock(&boot->lock);
+	spin_unlock_irqrestore(&real->lock, flags);
+	return sysfs_emit(buf, "version=1 realtime=%llu boottime=%llu "
+		"due_realtime=%u due_boottime=%u overflow=%u guarded=%u "
+		"last_realtime_ns=%llu last_boottime_ns=%llu\n",
+		(unsigned long long)real_events, (unsigned long long)boot_events,
+		real_due, boot_due, overflow, !!alarm_events_wakeup,
+		(unsigned long long)real_last, (unsigned long long)boot_last);
+}
+static DEVICE_ATTR_RO(alarm_events);
+
+static struct attribute *alarm_event_attrs[] = {
+	&dev_attr_alarm_events.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(alarm_event);
+
 /* Suspend hook structures */
 static const struct dev_pm_ops alarmtimer_pm_ops = {
 	.suspend = alarmtimer_suspend,
@@ -835,6 +903,7 @@ static struct platform_driver alarmtimer_driver = {
 	.driver = {
 		.name = "alarmtimer",
 		.pm = &alarmtimer_pm_ops,
+		.dev_groups = alarm_event_groups,
 	}
 };
 
@@ -873,12 +942,15 @@ static int __init alarmtimer_init(void)
 	if (error)
 		return error;
 
+	alarm_events_wakeup = wakeup_source_register(NULL, "alarmtimer-events");
 	error = platform_driver_register(&alarmtimer_driver);
 	if (error)
 		goto out_if;
 
 	return 0;
 out_if:
+	wakeup_source_unregister(alarm_events_wakeup);
+	alarm_events_wakeup = NULL;
 	alarmtimer_rtc_interface_remove();
 	return error;
 }

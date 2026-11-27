@@ -31,6 +31,8 @@
 #include <linux/memblock.h>
 #include <linux/interrupt.h>
 #include <linux/ptrace.h>
+#include <linux/q2-pm-checkpoint.h>
+#include <linux/q2-pm-fault-origin.h>
 #include <linux/kgdb.h>
 #include <linux/kdebug.h>
 #include <linux/kprobes.h>
@@ -398,6 +400,8 @@ void __noreturn die(const char *str, struct pt_regs *regs)
 	static int die_counter;
 	int sig = SIGSEGV;
 
+	if (!user_mode(regs))
+		q2_pm_mmu_fault_origin(regs,read_c0_badvaddr(),4,q2_fault_die_origin(str));
 	oops_enter();
 
 	if (notify_die(DIE_OOPS, str, regs, 0, current->thread.trap_nr,
@@ -1992,6 +1996,10 @@ void __noreturn nmi_exception_handler(struct pt_regs *regs)
 {
 	char str[100];
 
+	/* The assembly frame has normalized Status; saved EPC is not rewritten yet. */
+	if (!user_mode(regs))
+		q2_pm_mmu_fault_origin(regs,read_c0_badvaddr(),4,Q2_ORIGIN_NMI);
+
 	nmi_enter();
 	raw_notifier_call_chain(&nmi_chain, 0, regs);
 	bust_spinlocks(1);
@@ -2205,6 +2213,11 @@ static void configure_exception_vector(void)
 {
 	if (cpu_has_mips_r2_r6) {
 		unsigned long sr = set_c0_status(ST0_BEV);
+		/*
+		 * Changing EBase while BEV=0 is UNDEFINED: let BEV take effect
+		 * first, as decode_configs() does when probing WG.
+		 */
+		back_to_back_c0_hazard();
 		/* If available, use WG to set top bits of EBASE */
 		if (cpu_has_ebase_wg) {
 #ifdef CONFIG_64BIT
@@ -2212,9 +2225,16 @@ static void configure_exception_vector(void)
 #else
 			write_c0_ebase(ebase | MIPS_EBASE_WG);
 #endif
+			back_to_back_c0_hazard();
 		}
 		write_c0_ebase(ebase);
+		back_to_back_c0_hazard();
+		/* An ignored write leaves the boot loader's vectors live. */
+		if ((read_c0_ebase() ^ ebase) & 0x3ffff000)
+			panic("EBase write ignored: %08lx wanted %08lx",
+			      (unsigned long)read_c0_ebase(), ebase);
 		write_c0_status(sr);
+		back_to_back_c0_hazard();
 	}
 	if (cpu_has_veic || cpu_has_vint) {
 		/* Setting vector spacing enables EI/VI mode  */

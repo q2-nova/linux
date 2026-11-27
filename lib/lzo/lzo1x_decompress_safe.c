@@ -12,6 +12,7 @@
  *  Richard Purdie <rpurdie@openedhand.com>
  */
 
+#ifndef LZO_DECOMPRESS_BODY
 #ifndef STATIC
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -36,8 +37,60 @@
  */
 #define MAX_255_COUNT      ((((size_t)~0) / 255) - 2)
 
+#define LZO_DECOMPRESS_BODY
+#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+#define LZO_DECOMPRESS_FN lzo1x_decompress_safe
+#define LZO_UNALIGNED 1
+#include "lzo1x_decompress_safe.c"
+#elif defined(STATIC)
+#define LZO_DECOMPRESS_FN lzo1x_decompress_safe
+#define LZO_UNALIGNED 0
+#include "lzo1x_decompress_safe.c"
+#else
+/*
+ * Without efficient unaligned access the copies are byte loops. The
+ * variant with the unaligned-access copies (get_unaligned/put_unaligned:
+ * lwl/lwr and swl/swr on MIPS32) is selected at run time with
+ * /sys/module/lzo_decompress/parameters/variant: 0 byte loops (upstream on
+ * this architecture), 1 unaligned 32-bit copies (default).
+ */
+#define LZO_DECOMPRESS_FN lzo1x_decompress_safe_bytes
+#define LZO_UNALIGNED 0
+#include "lzo1x_decompress_safe.c"
+#undef LZO_DECOMPRESS_FN
+#undef LZO_UNALIGNED
+#define LZO_DECOMPRESS_FN lzo1x_decompress_safe_unaligned
+#define LZO_UNALIGNED 1
+#include "lzo1x_decompress_safe.c"
+
+unsigned int lzo_decompress_variant = 1;
+module_param_named(variant, lzo_decompress_variant, uint, 0644);
+
 int lzo1x_decompress_safe(const unsigned char *in, size_t in_len,
 			  unsigned char *out, size_t *out_len)
+{
+	if (READ_ONCE(lzo_decompress_variant) == 1)
+		return lzo1x_decompress_safe_unaligned(in, in_len, out, out_len);
+	return lzo1x_decompress_safe_bytes(in, in_len, out, out_len);
+}
+#endif
+#undef LZO_DECOMPRESS_BODY
+
+#ifndef STATIC
+EXPORT_SYMBOL_GPL(lzo1x_decompress_safe);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("LZO1X Decompressor");
+
+#endif
+
+#else /* LZO_DECOMPRESS_BODY */
+
+#if !defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) && !defined(STATIC)
+static
+#endif
+int LZO_DECOMPRESS_FN(const unsigned char *in, size_t in_len,
+		      unsigned char *out, size_t *out_len)
 {
 	unsigned char *op;
 	const unsigned char *ip;
@@ -92,7 +145,7 @@ int lzo1x_decompress_safe(const unsigned char *in, size_t in_len,
 				}
 				t += 3;
 copy_literal_run:
-#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+#if LZO_UNALIGNED
 				if (likely(HAVE_IP(t + 15) && HAVE_OP(t + 15))) {
 					const unsigned char *ie = ip + t;
 					unsigned char *oe = op + t;
@@ -210,7 +263,7 @@ copy_literal_run:
 			}
 		}
 		TEST_LB(m_pos);
-#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+#if LZO_UNALIGNED
 		if (op - m_pos >= 8) {
 			unsigned char *oe = op + t;
 			if (likely(HAVE_OP(t + 15))) {
@@ -252,7 +305,7 @@ copy_literal_run:
 match_next:
 		state = next;
 		t = next;
-#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+#if LZO_UNALIGNED
 		if (likely(HAVE_IP(6) && HAVE_OP(4))) {
 			COPY4(op, ip);
 			op += t;
@@ -287,10 +340,5 @@ lookbehind_overrun:
 	*out_len = op - out;
 	return LZO_E_LOOKBEHIND_OVERRUN;
 }
-#ifndef STATIC
-EXPORT_SYMBOL_GPL(lzo1x_decompress_safe);
 
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("LZO1X Decompressor");
-
-#endif
+#endif /* LZO_DECOMPRESS_BODY */

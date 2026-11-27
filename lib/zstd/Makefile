@@ -42,3 +42,14 @@ zstd_common-y := \
 		common/error_private.o \
 		common/fse_decompress.o \
 		common/zstd_common.o \
+
+# Q2: the decompression objects at -O2 instead of CONFIG_CC_OPTIMIZE_FOR_SIZE
+# (the last -O wins); measured in tests/perf/decomp.
+CFLAGS_zstd_decompress_module.o += -O2
+CFLAGS_decompress/huf_decompress.o += -O2
+CFLAGS_decompress/zstd_ddict.o += -O2
+CFLAGS_decompress/zstd_decompress.o += -O2
+CFLAGS_decompress/zstd_decompress_block.o += -O2
+CFLAGS_common/entropy_common.o += -O2
+CFLAGS_common/fse_decompress.o += -O2
+CFLAGS_common/zstd_common.o += -O2

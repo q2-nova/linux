@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/interrupt-controller/ingenic,x2000-intc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Ingenic X2000 interrupt and system-wake controllers
+
+maintainers:
+  - Paul Cercueil <paul@crapouillou.net>
+
+description: |
+  Per-core interrupt masks route 64 sources independently. A separate bank,
+  clocked only for system sleep, selects the sources that can wake the SoC.
+
+properties:
+  compatible:
+    const: ingenic,x2000-intc
+  reg:
+    items:
+      - description: Per-core routing banks
+      - description: System-wake bank
+  reg-names:
+    items:
+      - const: core
+      - const: wake
+  clocks:
+    maxItems: 1
+  clock-names:
+    const: wake
+  interrupts:
+    maxItems: 1
+  interrupt-controller: true
+  "#interrupt-cells":
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - clock-names
+  - interrupts
+  - interrupt-controller
+  - "#interrupt-cells"
+
+additionalProperties: false

@@ -139,6 +139,8 @@ enum input_clock_type {
  *	input core.
  */
 struct input_dev {
+	/* Optional admission event accounting; not hardware wake enablement. */
+	struct wakeup_source *suspend_guard;
 	const char *name;
 	const char *phys;
 	const char *uniq;

@@ -55,6 +55,7 @@ enum jz4740_rtc_type {
 	ID_JZ4740,
 	ID_JZ4760,
 	ID_JZ4780,
+	ID_X2000,
 };
 
 struct jz4740_rtc {
@@ -204,6 +205,14 @@ static int jz4740_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alrm)
 	struct jz4740_rtc *rtc = dev_get_drvdata(dev);
 	uint32_t secs = lower_32_bits(rtc_tm_to_time64(&alrm->time));
 
+	/* A masked alarm can leave AF pending. Clear it before programming a
+	 * new deadline so enabling the IRQ cannot deliver the old alarm.
+	 */
+	ret = jz4740_rtc_ctrl_set_bits(rtc, JZ_RTC_CTRL_AE |
+				     JZ_RTC_CTRL_AF_IRQ | JZ_RTC_CTRL_AF, false);
+	if (ret)
+		return ret;
+
 	ret = jz4740_rtc_reg_write(rtc, JZ_REG_RTC_SEC_ALARM, secs);
 	if (!ret)
 		ret = jz4740_rtc_ctrl_set_bits(rtc,
@@ -234,10 +243,12 @@ static irqreturn_t jz4740_rtc_irq(int irq, void *data)
 
 	ctrl = jz4740_rtc_reg_read(rtc, JZ_REG_RTC_CTRL);
 
-	if (ctrl & JZ_RTC_CTRL_1HZ)
+	if ((ctrl & (JZ_RTC_CTRL_1HZ | JZ_RTC_CTRL_1HZ_IRQ)) ==
+	    (JZ_RTC_CTRL_1HZ | JZ_RTC_CTRL_1HZ_IRQ))
 		events |= (RTC_UF | RTC_IRQF);
 
-	if (ctrl & JZ_RTC_CTRL_AF)
+	if ((ctrl & (JZ_RTC_CTRL_AF | JZ_RTC_CTRL_AF_IRQ)) ==
+	    (JZ_RTC_CTRL_AF | JZ_RTC_CTRL_AF_IRQ))
 		events |= (RTC_AF | RTC_IRQF);
 
 	rtc_update_irq(rtc->rtc, 1, events);
@@ -264,6 +275,7 @@ static const struct of_device_id jz4740_rtc_of_match[] = {
 	{ .compatible = "ingenic,jz4760-rtc", .data = (void *)ID_JZ4760 },
 	{ .compatible = "ingenic,jz4770-rtc", .data = (void *)ID_JZ4780 },
 	{ .compatible = "ingenic,jz4780-rtc", .data = (void *)ID_JZ4780 },
+	{ .compatible = "ingenic,x2000-rtc", .data = (void *)ID_X2000 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, jz4740_rtc_of_match);
@@ -377,12 +389,17 @@ static int jz4740_rtc_probe(struct platform_device *pdev)
 	if (IS_ERR(rtc->rtc))
 		return dev_err_probe(dev, PTR_ERR(rtc->rtc),
 				     "Failed to allocate rtc device\n");
+	rtc->rtc->alarm_wake_irq = irq;
 
 	rtc->rtc->ops = &jz4740_rtc_ops;
 	rtc->rtc->range_max = U32_MAX;
 
 	rate = clk_get_rate(clk);
-	jz4740_rtc_set_wakeup_params(rtc, np, rate);
+	/* X2000 has a different hibernate reset counter layout. Preserve
+	 * firmware wake/reset timing until that path is supported.
+	 */
+	if (rtc->type != ID_X2000)
+		jz4740_rtc_set_wakeup_params(rtc, np, rate);
 
 	/* Each 1 Hz pulse should happen after (rate) ticks */
 	jz4740_rtc_reg_write(rtc, JZ_REG_RTC_REGULATOR, rate - 1);

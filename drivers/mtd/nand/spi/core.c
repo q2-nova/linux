@@ -589,6 +589,7 @@ static int spinand_write_to_cache_op(struct spinand_device *spinand,
 	unsigned int nbytes, column = 0;
 	void *buf = spinand->databuf;
 	ssize_t ret;
+	bool initial = spinand->flags & SPINAND_NEEDS_PROGRAM_LOAD;
 
 	/*
 	 * Looks like PROGRAM LOAD (AKA write cache) does not necessarily reset
@@ -629,7 +630,31 @@ static int spinand_write_to_cache_op(struct spinand_device *spinand,
 		column |= req->pos.plane << fls(nanddev_page_size(nand));
 
 	while (nbytes) {
-		ret = spi_mem_dirmap_write(wdesc, column, nbytes, buf);
+		if (initial) {
+			struct spi_mem_op op = *spinand->op_templates->write_cache;
+
+			/* DS35GA ordinary page program uses initial LOAD (GA
+			 * datasheets, section 3.7). Use that sequence instead of
+			 * assuming RANDOM LOAD alone is equivalent.
+			 * Use the selected initial-load variant for the first
+			 * controller-sized chunk, then retain random-load
+			 * continuation semantics for smaller controllers.
+			 */
+			op.addr.val = wdesc->info.offset + column;
+			op.data.buf.out = buf;
+			op.data.nbytes = nbytes;
+			op.data.ecc = wdesc->info.op_tmpl->data.ecc;
+			ret = spi_mem_adjust_op_size(spinand->spimem, &op);
+			if (ret)
+				return ret;
+			ret = spi_mem_exec_op(spinand->spimem, &op);
+			if (ret)
+				return ret;
+			ret = op.data.nbytes;
+			initial = false;
+		} else {
+			ret = spi_mem_dirmap_write(wdesc, column, nbytes, buf);
+		}
 		if (ret < 0)
 			return ret;
 

@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/shanling,q2-audio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Shanling Q2 audio topology
+maintainers:
+  - linux-mips@vger.kernel.org
+description: |
+  X2000 BAIC1 drives four CS43131 control endpoints. In the stock PCM
+  configuration 0x30/31 copy left, 0x32/33 copy right, and B is inverted on
+  each endpoint. These are software-derived routing facts; analog wiring
+  and downstream supply topology still require board qualification.
+properties:
+  compatible:
+    const: shanling,q2-audio
+  audio-controller:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: X2000 audio subsystem
+  audio-codecs:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - description: CS43131 at address 0x30
+        maxItems: 1
+      - description: CS43131 at address 0x31
+        maxItems: 1
+      - description: CS43131 at address 0x32
+        maxItems: 1
+      - description: CS43131 at address 0x33
+        maxItems: 1
+    description: Four codec endpoints, in ascending I2C address order
+  mute-gpios:
+    maxItems: 1
+    description: Board output mute, active high on PB10
+  mode-gpios:
+    maxItems: 1
+    description: Board output mode, high for the stock headphone path on PB9
+  boost-gpios:
+    maxItems: 1
+    description: Stock high-volume boost control on PB2; initially held low
+required:
+  - compatible
+  - audio-controller
+  - audio-codecs
+  - mute-gpios
+  - mode-gpios
+  - boost-gpios
+additionalProperties: false

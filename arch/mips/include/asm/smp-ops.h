@@ -104,4 +104,17 @@ static inline int register_cps_smp_ops(void)
 }
 #endif
 
+#ifdef CONFIG_INGENIC_X2000_SMP
+
+extern int register_ingenic_x2000_smp_ops(void);
+
+#else
+
+static inline int register_ingenic_x2000_smp_ops(void)
+{
+	return -ENODEV;
+}
+
+#endif
+
 #endif /* __ASM_SMP_OPS_H */

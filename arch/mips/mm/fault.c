@@ -8,6 +8,7 @@
 #include <linux/context_tracking.h>
 #include <linux/signal.h>
 #include <linux/sched.h>
+#include <linux/q2-pm-checkpoint.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
@@ -326,6 +327,8 @@ asmlinkage void do_page_fault(struct pt_regs *regs,
 {
 	enum ctx_state prev_state;
 
+	if (!user_mode(regs))
+		q2_pm_mmu_fault(regs,address,3);
 	prev_state = exception_enter();
 	__do_page_fault(regs, write, address);
 	exception_exit(prev_state);

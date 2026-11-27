@@ -1856,6 +1856,17 @@ config INDYDOG
 	  timer expired and no process has written to /dev/watchdog during
 	  that time.
 
+config INGENIC_X2000_WDT
+	tristate "Ingenic X2000 TCU watchdog"
+	depends on MACH_INGENIC_SOC || COMPILE_TEST
+	depends on OF && HAS_IOMEM && COMMON_CLK
+	select WATCHDOG_CORE
+	help
+	  Standard watchdog interface for the X2000 TCU RTC counter.
+	  Preserves an already armed RTC watchdog during driver probe.
+	  The Q2 integration uses the OPCR watchdog mux (32768 Hz or
+	  EXCLK/512), with rounded tick deadlines and no pretimeout interrupts.
+
 config JZ4740_WDT
 	tristate "Ingenic jz4740 SoC hardware watchdog"
 	depends on MIPS || COMPILE_TEST
