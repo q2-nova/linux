@@ -244,7 +244,7 @@ static int x2000_pwm_program(struct x2000_pwm *p, unsigned int n,
 	writel(BIT(n), p->base + PWM_ENC);
 	writel(BIT(n), p->base + PWM_DEC);
 	x2000_pwm_update(p, PWM_DCR0, BIT(n), 0);
-	x2000_pwm_update(p, PWM_CCFG(n), 0xf << shift, scale << shift);
+	x2000_pwm_update(p, PWM_CCFG(n), 0xfU << shift, scale << shift);
 	x2000_pwm_update(p, PWM_INITR, BIT(n) | BIT(n + 16), 0);
 	writel((duty << 16) | (period - duty), p->base + PWM_WCFG(n));
 	x2000_pwm_update(p, PWM_OEN, BIT(n), BIT(n));
@@ -331,7 +331,7 @@ int x2000_pwm_dma_prepare(struct pwm_device *pwm, dma_addr_t addr, u32 words)
 
 	spin_lock_irqsave(&p->lock, flags);
 	/* Prescaler 1: buffer counts are PWM input clocks. */
-	v = readl(p->base + PWM_CCFG(n)) & ~(0xf << shift);
+	v = readl(p->base + PWM_CCFG(n)) & ~(0xfU << shift);
 	writel(v, p->base + PWM_CCFG(n));
 	/* Initial and idle output low. */
 	v = readl(p->base + PWM_INITR) & ~(BIT(n) | BIT(n + 16));
