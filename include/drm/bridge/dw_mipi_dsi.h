@@ -53,6 +53,8 @@ struct dw_mipi_dsi_host_ops {
 struct dw_mipi_dsi_plat_data {
 	void __iomem *base;
 	unsigned int max_data_lanes;
+	/* Keep the two-frame guard at high-resolution timer granularity. */
+	bool precise_frame_wait;
 
 	enum drm_mode_status (*mode_valid)(void *priv_data,
 					   const struct drm_display_mode *mode,

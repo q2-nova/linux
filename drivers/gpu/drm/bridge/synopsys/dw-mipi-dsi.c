@@ -285,13 +285,18 @@ static inline bool dw_mipi_is_dual_mode(struct dw_mipi_dsi *dsi)
  * The controller should generate 2 frames before
  * preparing the peripheral.
  */
-static void dw_mipi_dsi_wait_for_two_frames(const struct drm_display_mode *mode)
+static void dw_mipi_dsi_wait_for_two_frames(struct dw_mipi_dsi *dsi,
+					   const struct drm_display_mode *mode)
 {
 	int refresh, two_frames;
 
 	refresh = drm_mode_vrefresh(mode);
 	two_frames = DIV_ROUND_UP(MSEC_PER_SEC, refresh) * 2;
-	msleep(two_frames);
+	if (dsi->plat_data->precise_frame_wait)
+		usleep_range(two_frames * USEC_PER_MSEC,
+			     (two_frames + 1) * USEC_PER_MSEC);
+	else
+		msleep(two_frames);
 }
 
 static inline struct dw_mipi_dsi *host_to_dsi(struct mipi_dsi_host *host)
@@ -1017,7 +1022,7 @@ static void dw_mipi_dsi_mode_set(struct dw_mipi_dsi *dsi,
 
 	dw_mipi_dsi_dphy_enable(dsi);
 
-	dw_mipi_dsi_wait_for_two_frames(adjusted_mode);
+	dw_mipi_dsi_wait_for_two_frames(dsi, adjusted_mode);
 
 	/* Switch to cmd mode for panel-bridge pre_enable & panel prepare */
 	dw_mipi_dsi_set_mode(dsi, 0);

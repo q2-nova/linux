@@ -129,7 +129,8 @@ static int q2_prepare(struct drm_panel *panel)
 	ret = mipi_dsi_dcs_exit_sleep_mode(p->dsi);
 	if (ret)
 		goto disable;
-	msleep(120);
+	/* Keep the stock 120 ms sleep-out minimum without jiffy rounding. */
+	usleep_range(120000, 121000);
 	return 0;
 disable:
 	gpiod_set_value_cansleep(p->reset, 1);

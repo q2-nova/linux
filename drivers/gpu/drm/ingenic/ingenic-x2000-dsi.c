@@ -2,6 +2,7 @@
 /* X2000 DSI PHY selector from stock soc_fb.ko and Ingenic's X2000 SDK. */
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <drm/bridge/dw_mipi_dsi.h>
 #include <drm/drm_mipi_dsi.h>
@@ -91,6 +92,7 @@ static int x2000_dsi_probe(struct platform_device *pdev)
 	if (IS_ERR(x->phy))
 		return PTR_ERR(x->phy);
 	x->pdata.max_data_lanes = 2;
+	x->pdata.precise_frame_wait = of_machine_is_compatible("shanling,q2");
 	x->pdata.phy_ops = &x2000_phy_ops;
 	x->pdata.priv_data = x;
 	x->dsi = dw_mipi_dsi_probe(pdev, &x->pdata);
