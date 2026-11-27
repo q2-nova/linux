@@ -7,17 +7,29 @@
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/pm.h>
+#include <linux/workqueue.h>
 #include <linux/regulator/consumer.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
 #include <video/mipi_display.h>
 
+/* Opt in to the experimental dark wake path only on this Q2 panel. */
+static bool wake_precharge;
+module_param(wake_precharge, bool, 0644);
+MODULE_PARM_DESC(wake_precharge, "Start the 2.8 V supply on system resume");
+
 struct q2_panel {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi;
 	struct gpio_desc *reset;
 	struct regulator *vdd28, *vdd33;
+	struct mutex rail_lock;
+	struct delayed_work expiry;
+	ktime_t rail_ready;
+	bool precharged;
 };
 
 struct q2_command {
@@ -96,16 +108,95 @@ static int q2_send(struct q2_panel *p, const struct q2_command *cmd)
 	return ret < 0 ? ret : 0;
 }
 
+/* The 3.3 V rail, reset release, host guard and every DCS command
+ * remain owned by DRM. A speculative 2.8 V regulator reference is
+ * transferred once to prepare(), or released on timeout/suspend/remove.
+ */
+static int q2_release_precharge(struct q2_panel *p)
+{
+	int ret = 0;
+
+	mutex_lock(&p->rail_lock);
+	if (p->precharged) {
+		ret = regulator_disable(p->vdd28);
+		if (!ret)
+			p->precharged = false;
+	}
+	mutex_unlock(&p->rail_lock);
+	return ret;
+}
+
+static void q2_expire_precharge(struct work_struct *work)
+{
+	struct q2_panel *p = container_of(to_delayed_work(work),
+					  struct q2_panel, expiry);
+
+	if (q2_release_precharge(p))
+		dev_err(&p->dsi->dev, "could not release wake precharge\n");
+}
+
+static int q2_take_supply(struct q2_panel *p)
+{
+	s64 wait;
+	int ret;
+
+	mutex_lock(&p->rail_lock);
+	if (p->precharged) {
+		p->precharged = false;
+		wait = DIV_ROUND_UP_ULL(max_t(s64, ktime_to_ns(ktime_sub(
+					p->rail_ready, ktime_get())), 0), NSEC_PER_USEC);
+		ret = 0;
+	} else {
+		ret = regulator_enable(p->vdd28);
+		wait = 15000;
+	}
+	mutex_unlock(&p->rail_lock);
+	if (!ret && wait)
+		usleep_range(wait, wait + 1000);
+	return ret;
+}
+
+static int q2_panel_suspend(struct device *dev)
+{
+	struct q2_panel *p = dev_get_drvdata(dev);
+
+	cancel_delayed_work_sync(&p->expiry);
+	return q2_release_precharge(p);
+}
+
+static int q2_panel_resume(struct device *dev)
+{
+	struct q2_panel *p = dev_get_drvdata(dev);
+	int ret;
+
+	if (!READ_ONCE(wake_precharge))
+		return 0;
+	mutex_lock(&p->rail_lock);
+	if (!p->precharged) {
+		ret = regulator_enable(p->vdd28);
+		if (!ret) {
+			p->rail_ready = ktime_add_ms(ktime_get(), 15);
+			p->precharged = true;
+			mod_delayed_work(system_wq, &p->expiry, msecs_to_jiffies(750));
+		} else {
+			/* DRM retries its normal sequence on the next modeset. */
+			dev_warn(dev, "wake precharge failed: %d\n", ret);
+		}
+	}
+	mutex_unlock(&p->rail_lock);
+	return 0;
+}
+static DEFINE_SIMPLE_DEV_PM_OPS(q2_panel_pm_ops, q2_panel_suspend, q2_panel_resume);
+
 static int q2_prepare(struct drm_panel *panel)
 {
 	struct q2_panel *p = to_q2(panel);
 	unsigned int i;
 	int ret;
 
-	ret = regulator_enable(p->vdd28);
+	ret = q2_take_supply(p);
 	if (ret)
 		return ret;
-	usleep_range(15000, 16000);
 	ret = regulator_enable(p->vdd33);
 	if (ret)
 		goto disable28;
@@ -203,6 +294,8 @@ static int q2_panel_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(p))
 		return PTR_ERR(p);
 	p->dsi = dsi;
+	mutex_init(&p->rail_lock);
+	INIT_DELAYED_WORK(&p->expiry, q2_expire_precharge);
 	p->reset = devm_gpiod_get(&dsi->dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(p->reset))
 		return dev_err_probe(&dsi->dev, PTR_ERR(p->reset), "reset GPIO\n");
@@ -231,6 +324,9 @@ static void q2_panel_remove(struct mipi_dsi_device *dsi)
 {
 	struct q2_panel *p = mipi_dsi_get_drvdata(dsi);
 
+	cancel_delayed_work_sync(&p->expiry);
+	if (q2_release_precharge(p))
+		dev_err(&dsi->dev, "could not release wake precharge on remove\n");
 	drm_panel_disable(&p->panel);
 	drm_panel_unprepare(&p->panel);
 	mipi_dsi_detach(dsi);
@@ -249,6 +345,7 @@ static struct mipi_dsi_driver q2_panel_driver = {
 	.driver = {
 		.name = "panel-shanling-q2",
 		.of_match_table = q2_panel_match,
+		.pm = pm_sleep_ptr(&q2_panel_pm_ops),
 	},
 };
 module_mipi_dsi_driver(q2_panel_driver);
