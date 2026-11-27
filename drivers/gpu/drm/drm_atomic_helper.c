@@ -3863,8 +3863,8 @@ EXPORT_SYMBOL(drm_atomic_helper_suspend);
  * See also:
  * drm_atomic_helper_suspend()
  */
-int drm_atomic_helper_commit_duplicated_state(struct drm_atomic_commit *state,
-					      struct drm_modeset_acquire_ctx *ctx)
+static int commit_duplicated_state(struct drm_atomic_commit *state,
+					      struct drm_modeset_acquire_ctx *ctx, bool nonblock)
 {
 	int i, ret;
 	struct drm_plane *plane;
@@ -3890,11 +3890,16 @@ int drm_atomic_helper_commit_duplicated_state(struct drm_atomic_commit *state,
 	for_each_new_connector_in_state(state, connector, new_conn_state, i)
 		state->connectors[i].old_state = connector->state;
 
-	ret = drm_atomic_commit(state);
+	ret = nonblock ? drm_atomic_nonblocking_commit(state) : drm_atomic_commit(state);
 
 	state->acquire_ctx = NULL;
 
 	return ret;
+}
+int drm_atomic_helper_commit_duplicated_state(struct drm_atomic_commit *state,
+					      struct drm_modeset_acquire_ctx *ctx)
+{
+	return commit_duplicated_state(state, ctx, false);
 }
 EXPORT_SYMBOL(drm_atomic_helper_commit_duplicated_state);
 
@@ -3932,6 +3937,33 @@ int drm_atomic_helper_resume(struct drm_device *dev,
 	return err;
 }
 EXPORT_SYMBOL(drm_atomic_helper_resume);
+
+/**
+ * drm_atomic_helper_resume_nonblocking - submit a saved state without waiting
+ * @dev: DRM device, with all other modeset users still suspended
+ * @state: saved atomic commit, owned by the caller
+ *
+ * As in drm_atomic_helper_resume(), reset the hardware/software bookkeeping
+ * and repair the old state pointers before committing. On success the caller
+ * must keep its reference and join state->commit_work before resuming DRM
+ * clients or allowing independent commits which would stall in swap_state.
+ * On error no work was queued and the caller must put the saved state.
+ */
+int drm_atomic_helper_resume_nonblocking(struct drm_device *dev,
+					 struct drm_atomic_commit *state)
+{
+	struct drm_modeset_acquire_ctx ctx;
+	int err;
+
+	drm_mode_config_reset(dev);
+	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, err);
+	err = commit_duplicated_state(state, &ctx, true);
+	DRM_MODESET_LOCK_ALL_END(dev, ctx, err);
+
+	return err;
+}
+EXPORT_SYMBOL(drm_atomic_helper_resume_nonblocking);
+
 
 static int page_flip_common(struct drm_atomic_commit *state,
 			    struct drm_crtc *crtc,

@@ -9,6 +9,12 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/of.h>
+#include <linux/suspend.h>
+#include <linux/workqueue.h>
+#include <drm/drm_atomic.h>
+#include <drm/drm_client_event.h>
+#include <drm/drm_mipi_dsi.h>
 #include <linux/platform_device.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_bridge.h>
@@ -57,6 +63,14 @@ struct x2000_dpu {
 	bool changed, clock_on, event_vblank, stop_failed;
 	struct drm_pending_vblank_event *event;
 	u32 event_site;
+	atomic_t async_resume_armed;
+	bool async_resume_requested, resume_ordered;
+	const char *async_resume_path;
+	int async_resume_status;
+	struct drm_atomic_commit *resume_commit;
+	struct work_struct resume_finish;
+	struct completion resume_suppliers_ready;
+	struct notifier_block resume_notifier;
 };
 
 static struct x2000_dpu *to_dpu(struct drm_device *drm)
@@ -283,10 +297,178 @@ static const struct drm_crtc_helper_funcs x2000_crtc_helpers = {
 	.atomic_flush = x2000_flush,
 };
 static const struct drm_encoder_funcs x2000_encoder_funcs = { .destroy = drm_encoder_cleanup };
+static int x2000_commit(struct drm_device *drm, struct drm_atomic_commit *state,
+			bool nonblock)
+{
+	struct drm_atomic_commit *restore = READ_ONCE(to_dpu(drm)->resume_commit);
+
+	/*
+	 * A blocking commit normally stalls in swap_state behind the modeset
+	 * tail. Refuse competing flips until the restore owner joins that tail.
+	 */
+	if (restore && restore != state)
+		return -EBUSY;
+
+	return drm_atomic_helper_commit(drm, state, nonblock);
+}
+
+static void x2000_commit_tail(struct drm_atomic_commit *state)
+{
+	struct x2000_dpu *d = to_dpu(state->dev);
+
+	/* The DT display graph alone does not order the DSI, PMIC and panel
+	 * PM callbacks before this DPU. Hardware starts only after DPM complete.
+	 */
+	if (state == READ_ONCE(d->resume_commit) && !d->resume_ordered)
+		wait_for_completion(&d->resume_suppliers_ready);
+	drm_atomic_helper_commit_tail(state);
+}
+
+static const struct drm_mode_config_helper_funcs x2000_config_helpers = {
+	.atomic_commit_tail = x2000_commit_tail,
+};
+
+static int x2000_resume_notify(struct notifier_block *notifier,
+			       unsigned long event, void *unused)
+{
+	struct x2000_dpu *d = container_of(notifier, struct x2000_dpu, resume_notifier);
+
+	if (event == PM_POST_SUSPEND)
+		complete_all(&d->resume_suppliers_ready);
+	return NOTIFY_DONE;
+}
+
+static void x2000_remove_resume_notifier(void *data)
+{
+	struct x2000_dpu *d = data;
+
+	unregister_pm_notifier(&d->resume_notifier);
+}
+
+static void x2000_drop_panel_link(void *data)
+{
+	device_link_del(data);
+}
+
+static bool x2000_link_q2_panel(struct device *dev, struct drm_bridge *bridge)
+{
+	struct drm_bridge *next __free(drm_bridge_put) = drm_bridge_get_next_bridge(bridge);
+	struct mipi_dsi_device *panel;
+	struct device_link *link;
+
+	if (!next || !of_device_is_compatible(next->of_node, "shanling,q2-h0209s"))
+		return false;
+	panel = of_find_mipi_dsi_device_by_node(next->of_node);
+	if (!panel)
+		return false;
+	/* The panel device is a child of the DSI host and its DT supplies
+	 * link to the PMIC. DPM orders this consumer after the entire chain.
+	 */
+	link = device_link_add(dev, &panel->dev, DL_FLAG_STATELESS);
+	put_device(&panel->dev);
+	if (!link)
+		return false;
+	return !devm_add_action_or_reset(dev, x2000_drop_panel_link, link);
+}
+
+static void x2000_resume_clients(struct drm_device *drm)
+{
+	drm_client_dev_resume(drm);
+	if (drm->mode_config.poll_enabled)
+		drm_kms_helper_poll_enable(drm);
+}
+
+static void x2000_resume_finish(struct work_struct *work)
+{
+	struct x2000_dpu *d = container_of(work, struct x2000_dpu, resume_finish);
+	struct drm_atomic_commit *state = READ_ONCE(d->resume_commit);
+	struct drm_crtc_commit *commit = state->crtcs[drm_crtc_index(&d->crtc)].commit;
+	unsigned long flags;
+	int ret = 0;
+
+	flush_work(&state->commit_work);
+	spin_lock_irqsave(&d->drm.event_lock, flags);
+	if (!d->clock_on || !completion_done(&commit->flip_done)) {
+		ret = -ETIMEDOUT;
+		/* This is the DRM helper's own event with no file or out-fence.
+		 * Retire it as on disable so a later modeset can recover.
+		 */
+		if (d->event) {
+			drm_crtc_send_vblank_event(&d->crtc, d->event);
+			d->event = NULL;
+			if (d->event_vblank)
+				drm_crtc_vblank_put(&d->crtc);
+			d->event_vblank = false;
+		}
+	}
+	spin_unlock_irqrestore(&d->drm.event_lock, flags);
+	if (ret)
+		drm_err(&d->drm, "Q2 asynchronous restore lacked a completed flip\n");
+	WRITE_ONCE(d->async_resume_status, ret);
+	WRITE_ONCE(d->resume_commit, NULL);
+	drm_atomic_commit_put(state);
+	x2000_resume_clients(&d->drm);
+}
+
+static ssize_t q2_async_resume_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct x2000_dpu *d = dev_get_drvdata(dev);
+	int ret;
+
+	flush_work(&d->resume_finish);
+	ret = READ_ONCE(d->async_resume_status);
+	return ret ? ret : sysfs_emit(buf, "ready\n");
+}
+
+static ssize_t q2_async_resume_store(struct device *dev, struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct x2000_dpu *d = dev_get_drvdata(dev);
+	bool armed;
+	int ret = kstrtobool(buf, &armed);
+
+	if (ret)
+		return ret;
+	if (armed && READ_ONCE(d->resume_commit))
+		return -EBUSY;
+	atomic_set(&d->async_resume_armed, armed);
+	return count;
+}
+static DEVICE_ATTR(q2_async_resume, 0600, q2_async_resume_show, q2_async_resume_store);
+
+static ssize_t q2_async_resume_path_show(struct device *dev,
+					 struct device_attribute *attr, char *buf)
+{
+	struct x2000_dpu *d = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n", READ_ONCE(d->async_resume_path));
+}
+static DEVICE_ATTR_RO(q2_async_resume_path);
+
+static umode_t x2000_pm_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	return of_machine_is_compatible("shanling,q2") ? attr->mode : 0;
+}
+
+static struct attribute *x2000_pm_attrs[] = {
+	&dev_attr_q2_async_resume.attr,
+	&dev_attr_q2_async_resume_path.attr,
+	NULL,
+};
+static const struct attribute_group x2000_pm_group = {
+	.attrs = x2000_pm_attrs,
+	.is_visible = x2000_pm_visible,
+};
+static const struct attribute_group *x2000_pm_groups[] = {
+	&x2000_pm_group,
+	NULL,
+};
+
 static const struct drm_mode_config_funcs x2000_config_funcs = {
 	.fb_create = drm_gem_fb_create,
 	.atomic_check = drm_atomic_helper_check,
-	.atomic_commit = drm_atomic_helper_commit,
+	.atomic_commit = x2000_commit,
 };
 DEFINE_DRM_GEM_DMA_FOPS(x2000_fops);
 static const struct drm_driver x2000_driver = {
@@ -316,6 +498,8 @@ static int x2000_probe(struct platform_device *pdev)
 	if (IS_ERR(d))
 		return PTR_ERR(d);
 	platform_set_drvdata(pdev, d);
+	atomic_set(&d->async_resume_armed, 0);
+	INIT_WORK(&d->resume_finish, x2000_resume_finish);
 	d->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(d->regs))
 		return PTR_ERR(d->regs);
@@ -331,6 +515,7 @@ static int x2000_probe(struct platform_device *pdev)
 	d->drm.mode_config.min_width = d->drm.mode_config.max_width = 320;
 	d->drm.mode_config.min_height = d->drm.mode_config.max_height = 375;
 	d->drm.mode_config.funcs = &x2000_config_funcs;
+	d->drm.mode_config.helper_private = &x2000_config_helpers;
 	ret = drm_universal_plane_init(&d->drm, &d->plane, 1, &x2000_plane_funcs,
 				       formats, ARRAY_SIZE(formats), NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
 	if (ret)
@@ -363,6 +548,19 @@ static int x2000_probe(struct platform_device *pdev)
 	ret = devm_request_irq(dev, irq, x2000_irq, 0, dev_name(dev), d);
 	if (ret)
 		return ret;
+	if (of_machine_is_compatible("shanling,q2")) {
+		d->resume_ordered = x2000_link_q2_panel(dev, bridge);
+		d->async_resume_path = "sync";
+		init_completion(&d->resume_suppliers_ready);
+		d->resume_notifier.notifier_call = x2000_resume_notify;
+		d->resume_notifier.priority = INT_MAX;
+		ret = register_pm_notifier(&d->resume_notifier);
+		if (ret)
+			return ret;
+		ret = devm_add_action_or_reset(dev, x2000_remove_resume_notifier, d);
+		if (ret)
+			return ret;
+	}
 	drm_mode_config_reset(&d->drm);
 	ret = drm_dev_register(&d->drm, 0);
 	if (!ret)
@@ -374,6 +572,7 @@ static void x2000_remove(struct platform_device *pdev)
 {
 	struct x2000_dpu *d = platform_get_drvdata(pdev);
 
+	flush_work(&d->resume_finish);
 	drm_dev_unregister(&d->drm);
 	drm_atomic_helper_shutdown(&d->drm);
 }
@@ -381,17 +580,29 @@ static void x2000_shutdown(struct platform_device *pdev)
 {
 	struct x2000_dpu *d = platform_get_drvdata(pdev);
 
+	flush_work(&d->resume_finish);
 	drm_atomic_helper_shutdown(&d->drm);
 }
 static int x2000_suspend(struct device *dev)
 {
 	struct x2000_dpu *d = dev_get_drvdata(dev);
 
-	int ret = drm_mode_config_helper_suspend(&d->drm);
+	int ret;
+	bool armed = atomic_xchg(&d->async_resume_armed, 0);
 
-	if (!ret && d->stop_failed) {
-		drm_mode_config_helper_resume(&d->drm);
-		return -EBUSY;
+	/* A second suspend cannot take a snapshot of an unfinished restore. */
+	flush_work(&d->resume_finish);
+	d->async_resume_requested = armed && pm_suspend_target_state == PM_SUSPEND_MEM;
+	WRITE_ONCE(d->async_resume_status, 0);
+	WRITE_ONCE(d->async_resume_path, "sync");
+	ret = drm_mode_config_helper_suspend(&d->drm);
+
+	if (ret || d->stop_failed) {
+		d->async_resume_requested = false;
+		if (!ret) {
+			drm_mode_config_helper_resume(&d->drm);
+			return -EBUSY;
+		}
 	}
 	return ret;
 }
@@ -399,8 +610,31 @@ static int x2000_suspend(struct device *dev)
 static int x2000_resume(struct device *dev)
 {
 	struct x2000_dpu *d = dev_get_drvdata(dev);
+	struct drm_atomic_commit *state = d->drm.mode_config.suspend_state;
+	struct drm_crtc_state *previous = state ? drm_atomic_get_new_crtc_state(state, &d->crtc) : NULL;
+	bool async = d->async_resume_requested;
+	int ret;
 
-	return drm_mode_config_helper_resume(&d->drm);
+	d->async_resume_requested = false;
+	if (!async || !previous || !previous->active)
+		return drm_mode_config_helper_resume(&d->drm);
+
+	/* Submit under the normal modeset locks while userspace is still frozen. */
+	reinit_completion(&d->resume_suppliers_ready);
+	WRITE_ONCE(d->async_resume_path, d->resume_ordered ? "early" : "late");
+	WRITE_ONCE(d->resume_commit, state);
+	ret = drm_atomic_helper_resume_nonblocking(&d->drm, state);
+	d->drm.mode_config.suspend_state = NULL;
+	if (ret) {
+		WRITE_ONCE(d->resume_commit, NULL);
+		drm_atomic_commit_put(state);
+		x2000_resume_clients(&d->drm);
+		WRITE_ONCE(d->async_resume_status, ret);
+		drm_err(&d->drm, "Q2 asynchronous restore submission failed (%d)\n", ret);
+		return ret;
+	}
+	queue_work(system_long_wq, &d->resume_finish);
+	return 0;
 }
 static DEFINE_SIMPLE_DEV_PM_OPS(x2000_pm_ops, x2000_suspend, x2000_resume);
 
@@ -408,7 +642,7 @@ static const struct of_device_id x2000_match[] = { { .compatible = "ingenic,x200
 MODULE_DEVICE_TABLE(of, x2000_match);
 static struct platform_driver x2000_platform_driver = {
 	.probe = x2000_probe, .remove = x2000_remove, .shutdown = x2000_shutdown,
-	.driver = { .name = "ingenic-x2000-dpu", .of_match_table = x2000_match,
+	.driver = { .name = "ingenic-x2000-dpu", .of_match_table = x2000_match, .dev_groups = x2000_pm_groups,
 		.pm = pm_sleep_ptr(&x2000_pm_ops) },
 };
 module_platform_driver(x2000_platform_driver);

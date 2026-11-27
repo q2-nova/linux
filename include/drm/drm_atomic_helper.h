@@ -172,6 +172,8 @@ int drm_atomic_helper_commit_duplicated_state(struct drm_atomic_commit *state,
 					      struct drm_modeset_acquire_ctx *ctx);
 int drm_atomic_helper_resume(struct drm_device *dev,
 			     struct drm_atomic_commit *state);
+int drm_atomic_helper_resume_nonblocking(struct drm_device *dev,
+					 struct drm_atomic_commit *state);
 
 int drm_atomic_helper_page_flip(struct drm_crtc *crtc,
 				struct drm_framebuffer *fb,
