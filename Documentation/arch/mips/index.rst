@@ -10,5 +10,6 @@ MIPS-specific Documentation
 
    booting
    ingenic-tcu
+   shanling-q2
 
    features
