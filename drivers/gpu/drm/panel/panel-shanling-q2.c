@@ -233,6 +233,9 @@ disable28:
 
 static int q2_enable(struct drm_panel *panel)
 {
+	if (!panel->prepared)
+		return -EIO;
+
 	return mipi_dsi_dcs_set_display_on(to_q2(panel)->dsi);
 }
 

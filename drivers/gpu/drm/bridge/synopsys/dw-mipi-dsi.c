@@ -13,9 +13,11 @@
 #include <linux/debugfs.h>
 #include <linux/export.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/media-bus-format.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
@@ -241,6 +243,10 @@ struct debugfs_entries {
 };
 #endif /* CONFIG_DEBUG_FS */
 
+static bool q2_guard_overlap;
+module_param(q2_guard_overlap, bool, 0644);
+MODULE_PARM_DESC(q2_guard_overlap, "Experimental Q2 panel preparation during the two-frame guard");
+
 struct dw_mipi_dsi {
 	struct drm_bridge bridge;
 	struct mipi_dsi_host dsi_host;
@@ -255,6 +261,8 @@ struct dw_mipi_dsi {
 	u32 lanes;
 	u32 format;
 	unsigned long mode_flags;
+	bool q2_h0209s;
+	ktime_t command_ready_at;
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs;
@@ -281,6 +289,11 @@ static inline bool dw_mipi_is_dual_mode(struct dw_mipi_dsi *dsi)
 	return dsi->slave || dsi->master;
 }
 
+static unsigned int dw_mipi_dsi_two_frame_ms(const struct drm_display_mode *mode)
+{
+	return DIV_ROUND_UP(MSEC_PER_SEC, drm_mode_vrefresh(mode)) * 2;
+}
+
 /*
  * The controller should generate 2 frames before
  * preparing the peripheral.
@@ -288,10 +301,8 @@ static inline bool dw_mipi_is_dual_mode(struct dw_mipi_dsi *dsi)
 static void dw_mipi_dsi_wait_for_two_frames(struct dw_mipi_dsi *dsi,
 					   const struct drm_display_mode *mode)
 {
-	int refresh, two_frames;
+	unsigned int two_frames = dw_mipi_dsi_two_frame_ms(mode);
 
-	refresh = drm_mode_vrefresh(mode);
-	two_frames = DIV_ROUND_UP(MSEC_PER_SEC, refresh) * 2;
 	if (dsi->plat_data->precise_frame_wait)
 		usleep_range(two_frames * USEC_PER_MSEC,
 			     (two_frames + 1) * USEC_PER_MSEC);
@@ -337,6 +348,8 @@ static int dw_mipi_dsi_host_attach(struct mipi_dsi_host *host,
 	dsi->channel = device->channel;
 	dsi->format = device->format;
 	dsi->mode_flags = device->mode_flags;
+	dsi->q2_h0209s = dsi->plat_data->precise_frame_wait &&
+		of_device_is_compatible(device->dev.of_node, "shanling,q2-h0209s");
 
 	bridge = devm_drm_of_get_bridge(dsi->dev, dsi->dev->of_node, 1, 0);
 	if (IS_ERR(bridge))
@@ -373,6 +386,7 @@ static int dw_mipi_dsi_host_detach(struct mipi_dsi_host *host,
 			return ret;
 	}
 
+	dsi->command_ready_at = 0;
 	drm_of_panel_bridge_remove(host->dev->of_node, 1, 0);
 
 	drm_bridge_remove(&dsi->bridge);
@@ -507,6 +521,27 @@ static int dw_mipi_dsi_read(struct dw_mipi_dsi *dsi,
 	return ret;
 }
 
+static void dw_mipi_dsi_set_mode(struct dw_mipi_dsi *dsi,
+				 unsigned long mode_flags);
+
+static void dw_mipi_dsi_finish_command_guard(struct dw_mipi_dsi *dsi)
+{
+	s64 remaining;
+
+	if (!dsi->command_ready_at)
+		return;
+
+	remaining = ktime_sub(dsi->command_ready_at, ktime_get());
+	if (remaining > 0) {
+		unsigned long usecs = DIV_ROUND_UP_ULL(remaining, NSEC_PER_USEC);
+
+		usleep_range(usecs, usecs + 1000);
+	}
+
+	dw_mipi_dsi_set_mode(dsi, 0);
+	dsi->command_ready_at = 0;
+}
+
 static ssize_t dw_mipi_dsi_host_transfer(struct mipi_dsi_host *host,
 					 const struct mipi_dsi_msg *msg)
 {
@@ -520,6 +555,7 @@ static ssize_t dw_mipi_dsi_host_transfer(struct mipi_dsi_host *host,
 		return ret;
 	}
 
+	dw_mipi_dsi_finish_command_guard(dsi);
 	dw_mipi_message_config(dsi, msg);
 	if (dsi->slave)
 		dw_mipi_message_config(dsi->slave, msg);
@@ -955,7 +991,10 @@ static void dw_mipi_dsi_bridge_post_atomic_disable(struct drm_bridge *bridge,
 	 * Note: panel-bridge disable & panel disable has been called
 	 * before by the drm framework.
 	 */
-	dw_mipi_dsi_set_mode(dsi, 0);
+	if (dsi->command_ready_at)
+		dw_mipi_dsi_finish_command_guard(dsi);
+	else
+		dw_mipi_dsi_set_mode(dsi, 0);
 
 	if (phy_ops->power_off)
 		phy_ops->power_off(dsi->plat_data->priv_data);
@@ -1022,6 +1061,18 @@ static void dw_mipi_dsi_mode_set(struct dw_mipi_dsi *dsi,
 
 	dw_mipi_dsi_dphy_enable(dsi);
 
+	dsi->command_ready_at = 0;
+	if (READ_ONCE(q2_guard_overlap) && dsi->q2_h0209s &&
+	    !dw_mipi_is_dual_mode(dsi) && !phy_ops->power_on) {
+		/*
+		 * The Q2's panel prepare starts with rail/reset work. Preserve
+		 * the full elapsed guard before the host enters command mode.
+		 */
+		dsi->command_ready_at = ktime_add_ms(ktime_get(),
+					dw_mipi_dsi_two_frame_ms(adjusted_mode));
+		return;
+	}
+
 	dw_mipi_dsi_wait_for_two_frames(dsi, adjusted_mode);
 
 	/* Switch to cmd mode for panel-bridge pre_enable & panel prepare */
@@ -1056,6 +1107,9 @@ static void dw_mipi_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
 					     struct drm_atomic_commit *state)
 {
 	struct dw_mipi_dsi *dsi = bridge_to_dsi(bridge);
+
+	/* An unsuccessful panel prepare may never have attempted DCS. */
+	dw_mipi_dsi_finish_command_guard(dsi);
 
 	/* Switch to video mode for panel-bridge enable & panel enable */
 	dw_mipi_dsi_set_mode(dsi, MIPI_DSI_MODE_VIDEO);
