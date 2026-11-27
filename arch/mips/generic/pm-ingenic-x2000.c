@@ -54,9 +54,15 @@ static_assert(Q2_PA_OFFSET+Q2_PA_WORDS*4<=Q2_FOR_OFFSET);
 #define EPC_RESTORE 244
 #define CPM_PHYS 0x10000000
 #define CCU_PHYS 0x12200000
+#define RTC_PHYS 0x10003000
+#define RTC_RTCCR 0x00
+#define RTC_ENABLE BIT(0)
+#define RTC_USE_EXCLK BIT(1)
 #define CPM_CPCCR 0x00
 #define CPM_LCR 0x04
 #define CPM_OPCR 0x24
+#define CPM_CLKGR0 0x20
+#define CPM_RTC_GATED BIT(27)
 #define CCU_CSRR 0x40
 #define CCU_RER 0xf00
 
@@ -67,7 +73,7 @@ extern char q2_pm_exl_keep[];
 extern void q2_pm_precise_trap(void);
 /* Only the admitted IRQ-disabled CPU0 probe arms this one-shot gate. */
 u32 q2_pm_trap_gate;
-static void __iomem *sram, *cpm, *ccu;
+static void __iomem *sram, *cpm, *ccu, *rtc;
 static u32 attempts, core_returns, core_failures;
 static u32 roundtrip_returns, roundtrip_failures;
 static u32 cpu_only_returns, cpu_only_failures;
@@ -75,6 +81,7 @@ static u32 ddr_canary[16] __aligned(64);
 static struct kobject *proof_kobj;
 static bool journal_owner, journal_armed;
 static bool admission_normal;
+static bool normal_retain_exclk = true;
 static u32 journal_tag[4];
 /* Inactive diagnostic profile: ordinary automatic sleep is not qualified.
  * A referenced task identity, not a reusable numeric PID, owns admission.
@@ -1127,6 +1134,42 @@ static ssize_t entry_policy_show(struct kobject *kobj,
 }
 static struct kobj_attribute entry_policy_attr = __ATTR_RO(entry_policy);
 
+static ssize_t normal_exclk_show(struct kobject *kobj,
+                                 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "version=1 retain=%u\n", READ_ONCE(normal_retain_exclk));
+}
+
+static ssize_t normal_exclk_store(struct kobject *kobj, struct kobj_attribute *attr,
+                                 const char *buf, size_t count)
+{
+	unsigned int flags;
+	bool retain;
+
+	if (sysfs_streq(buf, "retain"))
+		retain = true;
+	else if (sysfs_streq(buf, "stop"))
+		retain = false;
+	else
+		return -EINVAL;
+
+	flags = lock_system_sleep();
+	WRITE_ONCE(normal_retain_exclk, retain);
+	unlock_system_sleep(flags);
+	return count;
+}
+static struct kobj_attribute normal_exclk_attr = __ATTR(normal_exclk, 0600, normal_exclk_show, normal_exclk_store);
+
+static bool x2000_normal_exclk_can_stop(void)
+{
+	/* Keep the independent RTC available. Ordinary suspend has
+	 * already proved that its watchdog is stopped. The common sleep
+	 * programming selects RTCLK for the watchdog in either policy.
+	 */
+	return rtc && (readl(rtc + RTC_RTCCR) & (RTC_ENABLE | RTC_USE_EXCLK)) == RTC_ENABLE &&
+	       !(readl(cpm + CPM_CLKGR0) & CPM_RTC_GATED);
+}
+
 static int x2000_pm_normal_begin(suspend_state_t state)
 {
 	struct pid *owner;
@@ -1151,7 +1194,7 @@ static int x2000_pm_normal_begin(suspend_state_t state)
 	admission_cpu_only = 0;
 	admission_checkpoint = false;
 	admission_cache_probe = 0;
-	admission_keep_exclk = true;
+	admission_keep_exclk = READ_ONCE(normal_retain_exclk);
 	admission_pd0 = true;
 	memset(journal_tag, 0, sizeof(journal_tag));
 	return 0;
@@ -1215,6 +1258,11 @@ static int x2000_pm_enter(suspend_state_t state)
 		return -EACCES;
 	}
 
+	if (admission_normal && !keep_exclk && !x2000_normal_exclk_can_stop()) {
+		core_failures++;
+		return -EOPNOTSUPP;
+	}
+
 	/* The SRAM index walk is the Q2's admitted D32/L2-64 geometry. CPU1
 	 * must be offline too; never execute a partial walk on another geometry.
 	 */
@@ -1271,9 +1319,9 @@ static int x2000_pm_enter(suspend_state_t state)
 		writel((opcr & ~(BIT(31) | BIT(26) | BIT(3))) |
 		       BIT(30) | BIT(21) | BIT(2), cpm + CPM_OPCR);
 	} else {
-		/* Owned osc-keep retains EXCLK; sleep-pd0 snapshots pd0_clock. Ordinary
-		 * arm/roundtrip keep the original oscillator-off entry. This
-		 * diagnostic choice is not a production low-power policy.
+		/* Owned osc-keep retains EXCLK; sleep-pd0 snapshots pd0_clock. Normal
+		 * SLEEP snapshots its independent clock policy. Diagnostic
+		 * arm/roundtrip keep the original oscillator-off entry.
 		 */
 		writel((opcr & ~(BIT(31) | BIT(26) | BIT(4) | BIT(3))) |
 		       BIT(30) | BIT(22) | BIT(21) | BIT(20) |
@@ -1435,7 +1483,9 @@ static int __init x2000_pm_init(void)
 		release_mem_region(SRAM_PHYS, SZ_32K);
 		return -ENOMEM;
 	}
-	if (!IS_ENABLED(CONFIG_INGENIC_X2000_NORMAL_SLEEP))
+	if (IS_ENABLED(CONFIG_INGENIC_X2000_NORMAL_SLEEP))
+		rtc = ioremap(RTC_PHYS, SZ_4K);
+	else
 		cache_probe_init_clock();
 	proof_kobj = kobject_create_and_add("q2_suspend", kernel_kobj);
 	if (!proof_kobj) {
@@ -1448,7 +1498,7 @@ static int __init x2000_pm_init(void)
   };
   static const struct attribute_group group = { .attrs = attributes };
   static struct attribute *normal_attributes[] = {
-   &entry_policy_attr.attr, &proof_attr.attr, NULL
+   &entry_policy_attr.attr, &normal_exclk_attr.attr, &proof_attr.attr, NULL
   };
   static const struct attribute_group normal_group = { .attrs = normal_attributes };
   ret = sysfs_create_group(proof_kobj,
@@ -1464,6 +1514,7 @@ static int __init x2000_pm_init(void)
 	pr_info("X2000: retained SRAM deep-sleep backend registered (%lu bytes)\n", size);
 	return 0;
 unmap:
+	iounmap(rtc);
 	iounmap(cache_probe_ost);
 	iounmap(sram);
 	iounmap(cpm);
